@@ -1,0 +1,66 @@
+name: Build
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  back:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        working-directory: back
+        run: pip install -r requirements.txt
+      - name: Smoke test — gateway boots and serves a real tool call
+        working-directory: back
+        run: |
+          python3 -c "
+          import asyncio
+          from gateway.server import Gateway, build_app
+
+          async def run():
+              gw = Gateway(['example-echo'])
+              build_app(gw, 'citoken', {})
+              await gw.start()
+              assert 'example-echo' in gw.upstreams
+              resp = await gw.handle({'jsonrpc':'2.0','id':1,'method':'tools/call',
+                  'params':{'name':'example_echo__echo','arguments':{'text':'ci'}}})
+              assert resp['result']['content'][0]['text'] == 'ci', resp
+
+          asyncio.run(run())
+          "
+      - name: Build image
+        run: docker build -t aw-mcp-gateway-back:ci back/
+
+  front:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - working-directory: front
+        run: npm install
+      - working-directory: front
+        run: npm run build
+      - name: Build image
+        run: docker build -t aw-mcp-gateway-front:ci front/
+
+  connector:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        working-directory: connector
+        run: pip install -r requirements.txt
+      - name: Compile check
+        working-directory: connector
+        run: python3 -m py_compile connector/*.py
+      - name: Build image
+        run: docker build -t aw-mcp-stdio-wrapper:ci connector/

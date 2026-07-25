@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "example-echo": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-m", "gateway.examples.echo_server"],
+      "enabled": true,
+      "_comment": "A real (if trivial) stdio MCP server, enabled by default so a fresh checkout has one working local upstream out of the box. Add your own servers here (same shape as the main agentic-workspace .mcp.json), or let apps dial in via /link instead of listing them here at all."
+    }
+  }
+}

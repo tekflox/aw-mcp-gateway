@@ -1,0 +1,35 @@
+"""Connector config — one JSON file, contract:
+
+{
+  "app_name": "my-app",              // unique name this app's tools show up as
+                                      // (gateway publishes "<app_name>__<tool>")
+  "gateway_url": "wss://gateway.example.com/link",
+  "token": "awlk_xxxx",              // opaque link token (see the top-level
+                                      // README's "connector" section for the
+                                      // current placeholder-vs-final-design
+                                      // status of this token)
+  "mcp": {
+    "command": "python3",
+    "args": ["-m", "my_app.mcp_server"],
+    "env": {}
+  }
+}
+
+Path defaults to ./app.json, overridable via APP_CONFIG env var.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+CONFIG_PATH = os.environ.get("APP_CONFIG", "app.json")
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+    for required in ("app_name", "gateway_url", "token", "mcp"):
+        if required not in cfg:
+            raise ValueError(f"{CONFIG_PATH}: missing required field '{required}'")
+    return cfg

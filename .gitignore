@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+dist/
+app.json
+back/config/gateway.json.e2e
+*.tsbuildinfo

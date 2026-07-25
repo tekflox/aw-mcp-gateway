@@ -1,0 +1,10 @@
+{
+  "app_name": "my-app",
+  "gateway_url": "wss://gateway.example.com/link",
+  "token": "awlk_replace_with_a_real_link_token",
+  "mcp": {
+    "command": "python3",
+    "args": ["-m", "my_app.mcp_server"],
+    "env": {}
+  }
+}

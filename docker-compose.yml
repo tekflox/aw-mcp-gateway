@@ -1,0 +1,26 @@
+services:
+  back:
+    build: ./back
+    ports:
+      - "9200:9200"
+    volumes:
+      - ./back/config:/app/config
+
+  front:
+    build: ./front
+    ports:
+      - "4173:4173"
+    environment:
+      - BACK_URL=http://back:9200
+    depends_on:
+      - back
+
+  # Example connector instance — uncomment and provide your own app.json to
+  # run an aw-mcp-stdio-wrapper alongside the gateway. Not started by default
+  # (compose has nothing to wrap out of the box).
+  # connector:
+  #   build: ./connector
+  #   volumes:
+  #     - ./connector/app.json:/app/app.json:ro
+  #   depends_on:
+  #     - back

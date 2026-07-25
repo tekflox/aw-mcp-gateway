@@ -1,0 +1,7 @@
+{
+  "_comment": "Local gateway settings. Set a real 'token' before exposing this off loopback — an ephemeral one is minted (and logged) if left empty.",
+  "token": "",
+  "port": 9200,
+  "upstreams": ["example-echo"],
+  "configs": {}
+}
