@@ -24,16 +24,33 @@ export default function Upstreams() {
       <div className="card">
         <h3>Remote (dialed in via /link)</h3>
         <p>
-          Apps running the <code>connector/</code> wrapper elsewhere register here.
-          Full reverse-registration (token minting/scoping) is not yet built —
-          see <code>back/gateway/remote_upstream.py</code>.
+          Apps running the <code>connector/</code> wrapper elsewhere register here,
+          token-verified and scope-checked — see <code>back/gateway/remote_upstream.py</code>.
         </p>
         <ul>
           {(health?.remote_upstreams ?? []).map((name) => (
-            <li key={name}>{name}</li>
+            <li key={name}>{name} — connected</li>
           ))}
           {!health?.remote_upstreams?.length && <li>none connected</li>}
         </ul>
+      </div>
+      <div className="card">
+        <h3>Federated gateways ({"type: gateway"} upstreams)</h3>
+        <p>
+          Other aw-mcp-gateway instances whose whole tool pool is aggregated into
+          this one — configured in <code>back/config/mcp.json</code>.
+        </p>
+        <ul>
+          {(health?.federated_gateways ?? []).map((name) => (
+            <li key={name}>{name} — connected</li>
+          ))}
+          {!health?.federated_gateways?.length && <li>none federated</li>}
+        </ul>
+        <p>
+          This gateway: <code>{health?.gateway_id ?? "…"}</code>
+          {" — federation chain: "}
+          <code>{(health?.federation_chain ?? []).join(" → ") || "…"}</code>
+        </p>
       </div>
     </div>
   );

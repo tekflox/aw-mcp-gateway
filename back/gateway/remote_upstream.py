@@ -1,32 +1,23 @@
 """RemoteUpstream + the ``/link`` reverse-registration endpoint.
 
-STATUS: functional skeleton, not the final design. The full scheme (closed by
-the architect 2026-07-25, see the ``project_aw_apps_distribution_mcp_wrapper``
-design memory) is:
+A connector dials ``/link``, sends a ``register`` message with its
+``app_name``, ``token``, and its own ``tools/list`` result, and the gateway
+publishes those tools (namespaced ``{app_name}__{tool}``) and routes
+``tools/call`` back down the same live WebSocket, matching a Future to the
+JSON-RPC id — same dispatch pattern as ``upstream.Upstream``'s local stdio
+reader loop.
 
-* Opaque bearer token ``awlk_<id16>_<secret32>``, hashed (SHA-256) and stored
-  in the *user's own* Postgres (data plane) — minted from a "Hosts & Apps" UI,
-  scoped to an app/host via globs, revocable instantly.
-* A unified "host-link" WS transport carrying MCP in-band (this same
-  register/tools-call/tools-result shape) alongside other per-host channels
-  (agent coordination, byte-streams) — this file only implements the MCP
-  channel in isolation.
-* Tool names published as ``<app>__<tool>`` with a uniqueness-enforced app
-  name (collisions get suffixed, e.g. "Browser 1"/"Browser 2") — not done
-  here; this stub just uses whatever ``app_name`` the connector registers
-  with the first time.
+Closes the reverse-registration TODOs from the original skeleton:
 
-What IS real and working here: a connector can dial ``/link``, send a
-``register`` message with its ``app_name``, ``token``, and its own
-``tools/list`` result, and the gateway will publish those tools (namespaced
-``{app_name}__{tool}``) and route ``tools/call`` back down the same live
-WebSocket, matching a Future to the JSON-RPC id — same dispatch pattern as
-``upstream.Upstream``'s local stdio reader loop.
-
-TODO (tracked by the reverse-registration card in the apps-distribution
-design): real token minting/hashing/storage, per-app/host scope enforcement,
-app-name collision handling, reconnect-safe re-registration semantics beyond
-"last register wins".
+* **Token**: the ``token`` field is a real ``awlk_<id16>_<secret32>``
+  opaque token, verified against a ``TokenStore`` (SHA-256 hash lookup) —
+  see ``token_store.py`` for the storage abstraction and the Postgres TODO.
+* **Scope**: a token's ``scopes`` (glob allowlist over ``app_name:tool``)
+  filters which of the connector's declared tools actually get published —
+  an empty result after filtering is a hard reject, not a silent no-op.
+* **Collision**: app-name uniqueness is enforced by ``Gateway`` (see
+  ``server.py``'s ``register_remote``) — this module just supplies the
+  token's stable id as the reconnect-safe identity key.
 """
 
 from __future__ import annotations
@@ -38,6 +29,8 @@ import time
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from .token_store import TokenStore
+
 log = logging.getLogger("aw-mcp-gateway")
 
 
@@ -47,8 +40,10 @@ class RemoteUpstream:
     ``Upstream``/``HttpUpstream`` classes so ``Gateway`` can route to it
     identically regardless of transport."""
 
-    def __init__(self, app_name: str, websocket: WebSocket, tools: list[dict]):
-        self.app_name = app_name
+    def __init__(self, base_name: str, websocket: WebSocket, tools: list[dict], token_id: str):
+        self.base_name = base_name
+        self.app_name = base_name  # may be renamed by Gateway.register_remote on collision
+        self.token_id = token_id
         self.websocket = websocket
         self.tools = tools
         self._pending: dict[str, asyncio.Future] = {}
@@ -87,23 +82,15 @@ class RemoteUpstream:
             fut.set_result(msg)
 
 
-def _check_link_token(token: str | None, expected: str | None) -> bool:
-    """Pre-accept auth check. TODO: replace with the real
-    ``awlk_<id16>_<secret32>`` hash lookup — this is a placeholder equality
-    check against a single shared token in config/gateway.json."""
-    if not expected:
-        return False
-    return token == expected
-
-
-async def link_endpoint(websocket: WebSocket, gateway: "Gateway", link_token: str | None):  # noqa: F821
+async def link_endpoint(websocket: WebSocket, gateway: "Gateway", token_store: TokenStore):  # noqa: F821
     """WS handler for ``/link``. A connector dials in, sends one ``register``
     message, then the connection stays open for ``tools/call``/result
     exchange until it disconnects (at which point its tools are withdrawn)."""
     await websocket.accept()
     token = websocket.query_params.get("token") or websocket.headers.get("x-aw-link-token")
-    if not _check_link_token(token, link_token):
-        await websocket.close(code=4401, reason="invalid or missing link token")
+    link_token = token_store.verify(token or "")
+    if link_token is None:
+        await websocket.close(code=4401, reason="invalid, unknown, or revoked link token")
         return
 
     remote: RemoteUpstream | None = None
@@ -119,10 +106,22 @@ async def link_endpoint(websocket: WebSocket, gateway: "Gateway", link_token: st
             await websocket.close(code=4400, reason="register message missing app_name")
             return
 
-        remote = RemoteUpstream(app_name, websocket, tools)
+        scoped_tools = token_store.filter_scoped_tools(link_token, app_name, tools)
+        if tools and not scoped_tools:
+            await websocket.close(
+                code=4403,
+                reason=f"token scope {link_token.scopes} allows none of this app's tools")
+            return
+        if len(scoped_tools) < len(tools):
+            dropped = {t.get("name") for t in tools} - {t.get("name") for t in scoped_tools}
+            log.warning("link token %s scope dropped %d/%d tools for app '%s': %s",
+                        link_token.id, len(dropped), len(tools), app_name, sorted(dropped))
+
+        remote = RemoteUpstream(app_name, websocket, scoped_tools, link_token.id)
         gateway.register_remote(remote)
-        log.info("remote upstream registered: %s (%d tools)", app_name, len(tools))
-        await websocket.send_json({"type": "registered", "app_name": app_name})
+        log.info("remote upstream registered: %s (token=%s, %d tools)",
+                 remote.app_name, link_token.id, len(scoped_tools))
+        await websocket.send_json({"type": "registered", "app_name": remote.app_name})
 
         while True:
             raw = await websocket.receive_text()

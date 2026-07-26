@@ -18,7 +18,15 @@ from fastapi.responses import JSONResponse, Response
 from . import config
 from .config_gateway import ConfigGateway
 from .remote_upstream import RemoteUpstream, link_endpoint
-from .upstream import HttpUpstream, Upstream, public_name
+from .token_store import FileTokenStore, TokenStore
+from .upstream import (
+    FederationCycleError,
+    FederationDepthExceeded,
+    GatewayUpstream,
+    HttpUpstream,
+    Upstream,
+    public_name,
+)
 
 log = logging.getLogger("aw-mcp-gateway")
 
@@ -26,12 +34,17 @@ DEFAULT_ALLOW: list[str] = []  # empty = nothing local unless config/mcp.json + 
 
 
 class Gateway:
-    def __init__(self, allow: list[str]):
+    def __init__(self, allow: list[str], gateway_id: str | None = None, max_federation_depth: int | None = None):
         self.allow = allow
-        self.upstreams: dict[str, Upstream | HttpUpstream] = {}
-        self.remotes: dict[str, RemoteUpstream] = {}  # app_name -> RemoteUpstream
+        self.gateway_id = gateway_id or config.gateway_id()
+        self.max_federation_depth = max_federation_depth or config.max_federation_depth()
+        self.upstreams: dict[str, Upstream | HttpUpstream | GatewayUpstream] = {}
+        self.remotes: dict[str, RemoteUpstream] = {}  # public app_name -> RemoteUpstream (live only)
         self.routes: dict[str, tuple[str, str]] = {}  # public name -> (server, tool)
         self.agg_tools: list[dict] = []
+        # Reconnect-safe / collision-safe remote naming (see register_remote):
+        self._remote_by_token: dict[str, RemoteUpstream] = {}  # token_id -> RemoteUpstream, survives disconnects
+        self._remote_name_groups: dict[str, list[str]] = {}  # base_name -> [token_id, ...] registration order
 
     def _load_specs(self) -> dict[str, dict]:
         servers = config.load_mcp_servers()
@@ -45,7 +58,7 @@ class Gateway:
                 log.warning("upstream '%s' is disabled in config/mcp.json — skipping", name)
                 continue
             kind = spec.get("type", "stdio")
-            if kind not in ("stdio", "http"):
+            if kind not in ("stdio", "http", "gateway"):
                 log.warning("upstream '%s' has unsupported type=%s — skipping", name, kind)
                 continue
             out[name] = spec
@@ -55,11 +68,18 @@ class Gateway:
         specs = self._load_specs()
         for name, spec in specs.items():
             kind = spec.get("type", "stdio")
-            up: Upstream | HttpUpstream = (
-                HttpUpstream(name, spec) if kind == "http" else Upstream(name, spec)
-            )
+            up: Upstream | HttpUpstream | GatewayUpstream
+            if kind == "gateway":
+                up = GatewayUpstream(name, spec, self.gateway_id, self.max_federation_depth)
+            elif kind == "http":
+                up = HttpUpstream(name, spec)
+            else:
+                up = Upstream(name, spec)
             try:
                 await up.start()
+            except (FederationCycleError, FederationDepthExceeded) as exc:
+                log.error("federation upstream '%s' rejected: %s", name, exc)
+                continue
             except Exception:
                 log.exception("failed to start upstream %s", name)
                 continue
@@ -78,25 +98,82 @@ class Gateway:
         self.agg_tools.append(t)
         self.routes[public] = (server, tool["name"])
 
+    @property
+    def federation_chain(self) -> list[str]:
+        """This gateway's own id, prefixed onto the longest chain reported by
+        any federated (``type: gateway``) upstream — so a gateway three hops
+        downstream sees a 3-long chain and can refuse a 4th if it would
+        exceed its ``max_federation_depth``, and any gateway that recognizes
+        its own id already in here knows federating back would be a cycle."""
+        longest: list[str] = []
+        for up in self.upstreams.values():
+            if isinstance(up, GatewayUpstream) and up.remote_gateway_id:
+                candidate = list(up.remote_chain) or [up.remote_gateway_id]
+                if len(candidate) > len(longest):
+                    longest = candidate
+        return [self.gateway_id] + longest
+
     # ── Remote (WS-registered) upstreams ────────────────────────────────────
 
     def register_remote(self, remote: RemoteUpstream) -> None:
-        # A re-register from the same app_name replaces the old one — "last
-        # register wins" per the module TODO on reconnect semantics.
-        old = self.remotes.get(remote.app_name)
-        if old is not None:
-            self.unregister_remote(old)
+        """Assign ``remote`` its public app-name and publish its tools.
+
+        Reconnect-safe: the same token id reconnecting gets back the exact
+        public name it already had (no route duplication, no re-numbering).
+        Collision-safe: a genuinely different app registering with a base
+        name already in use gets uniquely numbered — per Fred's decision,
+        BOTH the original and the newcomer end up as "Browser 1"/"Browser 2"
+        (not a `{app}_{server}__{tool}` route mangle)."""
+        token_id = remote.token_id
+        prior = self._remote_by_token.get(token_id)
+        if prior is not None:
+            self._withdraw_remote(prior)
+            remote.app_name = prior.app_name
+        else:
+            base = remote.base_name
+            group = self._remote_name_groups.setdefault(base, [])
+            if not group:
+                remote.app_name = base
+            else:
+                if len(group) == 1:
+                    self._rename_remote(group[0], f"{base} 1")
+                remote.app_name = f"{base} {len(group) + 1}"
+            group.append(token_id)
+        self._remote_by_token[token_id] = remote
         self.remotes[remote.app_name] = remote
         for tool in remote.tools:
             self._add_route(remote.app_name, tool)
 
-    def unregister_remote(self, remote: RemoteUpstream) -> None:
-        if self.remotes.get(remote.app_name) is not remote:
+    def _rename_remote(self, token_id: str, new_name: str) -> None:
+        target = self._remote_by_token.get(token_id)
+        if target is None:
             return
-        del self.remotes[remote.app_name]
+        was_live = self.remotes.get(target.app_name) is target
+        self._withdraw_remote(target)
+        target.app_name = new_name
+        if was_live:
+            # Only republish routes if this remote actually has a live
+            # connection right now — a numbering rename triggered by a
+            # newcomer must not resurrect routes for a disconnected app.
+            self.remotes[new_name] = target
+            for tool in target.tools:
+                self._add_route(new_name, tool)
+
+    def _withdraw_remote(self, remote: RemoteUpstream) -> None:
+        """Drop a remote's live routes. Does NOT forget its name reservation
+        (``_remote_by_token`` / ``_remote_name_groups``) — that's what makes
+        a later reconnect land back on the same public name instead of
+        colliding with itself. Truth for routing purposes is "is it in
+        ``self.remotes``" — a disconnected remote is removed from there
+        immediately so no call is ever routed to a dead session."""
+        if self.remotes.get(remote.app_name) is remote:
+            del self.remotes[remote.app_name]
         self.agg_tools = [t for t in self.agg_tools
                           if self.routes.get(t["name"], ("",))[0] != remote.app_name]
         self.routes = {k: v for k, v in self.routes.items() if v[0] != remote.app_name}
+
+    def unregister_remote(self, remote: RemoteUpstream) -> None:
+        self._withdraw_remote(remote)
 
     async def handle(self, msg: dict) -> dict | None:
         """Dispatch one JSON-RPC message. Returns None for notifications."""
@@ -138,10 +215,12 @@ class Gateway:
             "code": -32601, "message": f"Unknown method: {method}"}}
 
 
-def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] | None = None) -> FastAPI:
+def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] | None = None,
+              token_store: TokenStore | None = None) -> FastAPI:
     from contextlib import asynccontextmanager
 
     named_configs = named_configs or {}
+    token_store = token_store or FileTokenStore(config.link_tokens_path())
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -172,11 +251,15 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
 
     @app.get("/healthz")
     async def healthz():
+        federated = [name for name, up in gateway.upstreams.items() if isinstance(up, GatewayUpstream)]
         return {"ok": True,
                 "local_upstreams": list(gateway.upstreams),
                 "remote_upstreams": list(gateway.remotes),
                 "tools": len(gateway.agg_tools),
-                "configs": list(named_configs.keys())}
+                "configs": list(named_configs.keys()),
+                "gateway_id": gateway.gateway_id,
+                "federation_chain": gateway.federation_chain,
+                "federated_gateways": federated}
 
     @app.post("/mcp")
     async def mcp_post(request: Request, authorization: str | None = Header(default=None)):
@@ -188,7 +271,27 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
 
     @app.websocket("/link")
     async def link_ws(websocket: WebSocket):
-        await link_endpoint(websocket, gateway, token)
+        await link_endpoint(websocket, gateway, token_store)
+
+    @app.get("/link-tokens")
+    async def list_link_tokens(authorization: str | None = Header(default=None)):
+        _check_auth(authorization)
+        return {"tokens": [t.public_dict() for t in token_store.list()]}
+
+    @app.post("/link-tokens")
+    async def mint_link_token(request: Request, authorization: str | None = Header(default=None)):
+        _check_auth(authorization)
+        body = await request.json()
+        full, record = token_store.mint(label=body.get("label", ""), scopes=body.get("scopes"))
+        # Full token is returned exactly once — only the hash is persisted.
+        return {"token": full, **record.public_dict()}
+
+    @app.post("/link-tokens/{token_id}/revoke")
+    async def revoke_link_token(token_id: str, authorization: str | None = Header(default=None)):
+        _check_auth(authorization)
+        if not token_store.revoke(token_id):
+            return JSONResponse({"error": "unknown token id"}, status_code=404)
+        return {"ok": True}
 
     for cfg_name, cfg_upstreams in named_configs.items():
         cgw = ConfigGateway(gateway, cfg_upstreams, name=cfg_name)
@@ -238,6 +341,8 @@ def main() -> None:
     log.info("AW MCP Gateway (standalone) on http://%s:%d/mcp (+ ws /link)", args.host, args.port)
     log.info("local upstream allowlist: %s", ", ".join(allow) or "—")
     log.info("bearer token: %s (source: config/gateway.json)", "set" if tok else "MISSING")
+    log.info("gateway_id: %s | max_federation_depth: %d | link tokens: %s",
+             gateway.gateway_id, gateway.max_federation_depth, config.link_tokens_path())
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

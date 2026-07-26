@@ -1,6 +1,8 @@
 {
-  "_comment": "Local gateway settings. Set a real 'token' before exposing this off loopback — an ephemeral one is minted (and logged) if left empty.",
+  "_comment": "Local gateway settings. Set a real 'token' before exposing this off loopback — an ephemeral one is minted (and logged) if left empty. 'gateway_id' pins this gateway's federation-chain identity across restarts (auto-generated per-process if left empty — fine for cycle detection, just not stable across restarts). 'max_federation_depth' caps how many gateway-upstream hops deep a tools/list can aggregate through before a federation is refused.",
   "token": "",
+  "gateway_id": "",
+  "max_federation_depth": 6,
   "port": 9200,
   "upstreams": ["example-echo"],
   "configs": {}

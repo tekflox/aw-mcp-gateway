@@ -240,3 +240,83 @@ class HttpUpstream:
                 "content": [{"type": "text",
                              "text": f"http upstream '{self.name}' error: {exc}"}],
                 "isError": True}}
+
+
+class FederationCycleError(RuntimeError):
+    """Raised when connecting a ``GatewayUpstream`` would close a loop back
+    to this gateway."""
+
+
+class FederationDepthExceeded(RuntimeError):
+    """Raised when connecting a ``GatewayUpstream`` would exceed the
+    configured ``max_federation_depth``."""
+
+
+def _healthz_url(mcp_url: str) -> str:
+    if mcp_url.endswith("/mcp"):
+        return mcp_url[: -len("/mcp")] + "/healthz"
+    return mcp_url.rstrip("/") + "/healthz"
+
+
+class GatewayUpstream(HttpUpstream):
+    """An upstream that is itself another aw-mcp-gateway instance (or any
+    Streamable-HTTP-compatible gateway exposing the same ``/healthz``
+    federation fields) — aggregates that gateway's *entire* tool pool into
+    this one, one level deeper in the ``{remote}__{tool}`` namespace (its
+    tools already carry their own upstream's prefix, so no name is ever
+    prefixed twice for the same hop).
+
+    Reuses ``HttpUpstream`` for the actual MCP handshake/dispatch (same
+    ``call_tool`` contract as every other upstream kind) and adds two
+    federation safety checks, both enforced once at connect time
+    (``start()``) against the remote's ``/healthz`` report rather than
+    per-request — cheap, and sufficient since the federation graph only
+    changes when a gateway (re)starts or its config is reloaded:
+
+    * **cycle detection** — refuse if this gateway's own id already
+      appears in the remote's reported ancestor chain (meaning the remote
+      is already downstream of us; federating it back in would close a
+      loop).
+    * **depth cap** — refuse if federating would make the chain longer
+      than ``max_federation_depth``.
+    """
+
+    def __init__(self, name: str, spec: dict, own_gateway_id: str, max_depth: int):
+        if spec.get("token") and "headers" not in spec:
+            spec = {**spec, "headers": {"Authorization": f"Bearer {spec['token']}"}}
+        super().__init__(name, spec)
+        self.own_gateway_id = own_gateway_id
+        self.max_depth = max_depth
+        self.remote_gateway_id: str | None = None
+        self.remote_chain: list[str] = []
+
+    async def start(self) -> None:
+        self._client = httpx.AsyncClient(timeout=30.0)
+        resp = await self._client.get(_healthz_url(self.url), headers=self._extra_headers)
+        resp.raise_for_status()
+        health = resp.json()
+        self.remote_gateway_id = health.get("gateway_id")
+        self.remote_chain = list(health.get("federation_chain") or [])
+
+        if self.own_gateway_id and self.own_gateway_id in self.remote_chain:
+            raise FederationCycleError(
+                f"federating '{self.name}' would create a cycle — this gateway's id "
+                f"already appears in its ancestor chain {self.remote_chain}")
+        if len(self.remote_chain) + 1 > self.max_depth:
+            raise FederationDepthExceeded(
+                f"federating '{self.name}' would exceed max_federation_depth="
+                f"{self.max_depth} (remote chain depth {len(self.remote_chain)})")
+
+        # Handshake + tools/list over the same client/session — identical
+        # dispatch to a plain HttpUpstream from here on.
+        init = await self._post({
+            "jsonrpc": "2.0", "id": "init", "method": "initialize",
+            "params": {"protocolVersion": DEFAULT_PROTOCOL,
+                       "capabilities": {}, "clientInfo": {"name": "aw-mcp-gateway", "version": "1.0.0"}}
+        })
+        log.info("gateway upstream %s initialized: %s", self.name,
+                 init.get("result", {}).get("serverInfo", {}).get("name", "?"))
+        listed = await self._post({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"})
+        self.tools = listed.get("result", {}).get("tools", [])
+        log.info("gateway upstream %s — %d federated tools (remote id=%s, chain depth=%d)",
+                 self.name, len(self.tools), self.remote_gateway_id, len(self.remote_chain))

@@ -23,6 +23,9 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MCP_JSON = os.environ.get("AW_MCP_JSON", os.path.join(BASE_DIR, "config", "mcp.json"))
 GATEWAY_JSON = os.environ.get("AW_GATEWAY_JSON", os.path.join(BASE_DIR, "config", "gateway.json"))
+LINK_TOKENS_JSON = os.environ.get("AW_LINK_TOKENS_JSON", os.path.join(BASE_DIR, "config", "link_tokens.json"))
+
+DEFAULT_MAX_FEDERATION_DEPTH = 6
 
 
 def load_mcp_servers() -> dict:
@@ -36,6 +39,29 @@ def load_gateway_config() -> dict:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+def link_tokens_path() -> str:
+    return LINK_TOKENS_JSON
+
+
+def max_federation_depth() -> int:
+    try:
+        return int(load_gateway_config().get("max_federation_depth") or DEFAULT_MAX_FEDERATION_DEPTH)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_FEDERATION_DEPTH
+
+
+def gateway_id() -> str:
+    """A stable id for this gateway process, used in the federation
+    ancestor-chain cycle check. Configurable (``gateway_id`` in
+    gateway.json) so a deployment can pin it across restarts; otherwise a
+    fresh one is minted per process — fine for cycle detection since a
+    changed id only makes the check more conservative, never less safe."""
+    configured = (load_gateway_config().get("gateway_id") or "").strip()
+    if configured:
+        return configured
+    return secrets.token_hex(8)
 
 
 def token() -> str:

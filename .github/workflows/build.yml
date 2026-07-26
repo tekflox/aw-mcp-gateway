@@ -13,7 +13,7 @@ jobs:
           python-version: "3.12"
       - name: Install deps
         working-directory: back
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-dev.txt
       - name: Smoke test — gateway boots and serves a real tool call
         working-directory: back
         run: |
@@ -32,6 +32,9 @@ jobs:
 
           asyncio.run(run())
           "
+      - name: Test suite — gateway↔gateway federation + /link register/scope/collision
+        working-directory: back
+        run: pytest -q
       - name: Build image
         run: docker build -t aw-mcp-gateway-back:ci back/
 

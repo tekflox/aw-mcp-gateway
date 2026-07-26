@@ -6,6 +6,13 @@
       "args": ["-m", "gateway.examples.echo_server"],
       "enabled": true,
       "_comment": "A real (if trivial) stdio MCP server, enabled by default so a fresh checkout has one working local upstream out of the box. Add your own servers here (same shape as the main agentic-workspace .mcp.json), or let apps dial in via /link instead of listing them here at all."
+    },
+    "example-leaf-gateway": {
+      "type": "gateway",
+      "url": "http://127.0.0.1:9201/mcp",
+      "token": "the-other-gateway's-bearer-token",
+      "enabled": false,
+      "_comment": "type='gateway' federates ANOTHER aw-mcp-gateway's whole tool pool into this one, one namespace level deeper ({this-name}__{remote-upstream}__{tool}). Template only — add it to gateway.json's 'upstreams' list once you have a real remote to point at."
     }
   }
 }
