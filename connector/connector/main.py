@@ -15,7 +15,7 @@ async def _main() -> None:
     mcp_spec = cfg["mcp"]
     local = LocalMcp(mcp_spec["command"], mcp_spec.get("args", []), mcp_spec.get("env"))
     await local.start()
-    await run_link(cfg["app_name"], cfg["gateway_url"], cfg["token"], local)
+    await run_link(cfg["app_name"], cfg.get("workspace_name", ""), cfg["gateway_url"], cfg["token"], local)
 
 
 def main() -> None:

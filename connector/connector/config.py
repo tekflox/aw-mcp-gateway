@@ -2,7 +2,9 @@
 
 {
   "app_name": "my-app",              // unique name this app's tools show up as
-                                      // (gateway publishes "<app_name>__<tool>")
+  "workspace_name": "my-workspace",  // optional; defaults to AW_WORKSPACE_NAME
+                                      // or WORKSPACE_NAME. When set, gateway
+                                      // publishes "<workspace>__<app_name>__<tool>".
   "gateway_url": "wss://gateway.example.com/link",
   "token": "awlk_xxxx",              // opaque link token (see the top-level
                                       // README's "connector" section for the
@@ -32,4 +34,10 @@ def load_config() -> dict:
     for required in ("app_name", "gateway_url", "token", "mcp"):
         if required not in cfg:
             raise ValueError(f"{CONFIG_PATH}: missing required field '{required}'")
+    cfg["workspace_name"] = (
+        cfg.get("workspace_name")
+        or os.environ.get("AW_WORKSPACE_NAME")
+        or os.environ.get("WORKSPACE_NAME")
+        or ""
+    )
     return cfg

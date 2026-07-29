@@ -39,12 +39,12 @@ class Gateway:
         self.gateway_id = gateway_id or config.gateway_id()
         self.max_federation_depth = max_federation_depth or config.max_federation_depth()
         self.upstreams: dict[str, Upstream | HttpUpstream | GatewayUpstream] = {}
-        self.remotes: dict[str, RemoteUpstream] = {}  # public app_name -> RemoteUpstream (live only)
+        self.remotes: dict[str, RemoteUpstream] = {}  # public route_name -> RemoteUpstream (live only)
         self.routes: dict[str, tuple[str, str]] = {}  # public name -> (server, tool)
         self.agg_tools: list[dict] = []
         # Reconnect-safe / collision-safe remote naming (see register_remote):
         self._remote_by_token: dict[str, RemoteUpstream] = {}  # token_id -> RemoteUpstream, survives disconnects
-        self._remote_name_groups: dict[str, list[str]] = {}  # base_name -> [token_id, ...] registration order
+        self._remote_name_groups: dict[str, list[str]] = {}  # workspace+base_name -> [token_id, ...] order
 
     def _load_specs(self) -> dict[str, dict]:
         servers = config.load_mcp_servers()
@@ -130,34 +130,34 @@ class Gateway:
             self._withdraw_remote(prior)
             remote.app_name = prior.app_name
         else:
-            base = remote.base_name
+            base = f"{remote.workspace_name}::{remote.base_name}"
             group = self._remote_name_groups.setdefault(base, [])
             if not group:
-                remote.app_name = base
+                remote.app_name = remote.base_name
             else:
                 if len(group) == 1:
-                    self._rename_remote(group[0], f"{base} 1")
-                remote.app_name = f"{base} {len(group) + 1}"
+                    self._rename_remote(group[0], f"{remote.base_name} 1")
+                remote.app_name = f"{remote.base_name} {len(group) + 1}"
             group.append(token_id)
         self._remote_by_token[token_id] = remote
-        self.remotes[remote.app_name] = remote
+        self.remotes[remote.route_name] = remote
         for tool in remote.tools:
-            self._add_route(remote.app_name, tool)
+            self._add_route(remote.route_name, tool)
 
     def _rename_remote(self, token_id: str, new_name: str) -> None:
         target = self._remote_by_token.get(token_id)
         if target is None:
             return
-        was_live = self.remotes.get(target.app_name) is target
+        was_live = self.remotes.get(target.route_name) is target
         self._withdraw_remote(target)
         target.app_name = new_name
         if was_live:
             # Only republish routes if this remote actually has a live
             # connection right now — a numbering rename triggered by a
             # newcomer must not resurrect routes for a disconnected app.
-            self.remotes[new_name] = target
+            self.remotes[target.route_name] = target
             for tool in target.tools:
-                self._add_route(new_name, tool)
+                self._add_route(target.route_name, tool)
 
     def _withdraw_remote(self, remote: RemoteUpstream) -> None:
         """Drop a remote's live routes. Does NOT forget its name reservation
@@ -166,11 +166,11 @@ class Gateway:
         colliding with itself. Truth for routing purposes is "is it in
         ``self.remotes``" — a disconnected remote is removed from there
         immediately so no call is ever routed to a dead session."""
-        if self.remotes.get(remote.app_name) is remote:
-            del self.remotes[remote.app_name]
+        if self.remotes.get(remote.route_name) is remote:
+            del self.remotes[remote.route_name]
         self.agg_tools = [t for t in self.agg_tools
-                          if self.routes.get(t["name"], ("",))[0] != remote.app_name]
-        self.routes = {k: v for k, v in self.routes.items() if v[0] != remote.app_name}
+                          if self.routes.get(t["name"], ("",))[0] != remote.route_name]
+        self.routes = {k: v for k, v in self.routes.items() if v[0] != remote.route_name}
 
     def unregister_remote(self, remote: RemoteUpstream) -> None:
         self._withdraw_remote(remote)

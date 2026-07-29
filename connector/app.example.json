@@ -1,5 +1,6 @@
 {
   "app_name": "my-app",
+  "workspace_name": "my-workspace",
   "gateway_url": "wss://gateway.example.com/link",
   "token": "awlk_replace_with_a_real_link_token",
   "mcp": {

@@ -1,8 +1,10 @@
 """RemoteUpstream + the ``/link`` reverse-registration endpoint.
 
 A connector dials ``/link``, sends a ``register`` message with its
-``app_name``, ``token``, and its own ``tools/list`` result, and the gateway
-publishes those tools (namespaced ``{app_name}__{tool}``) and routes
+``app_name``, ``workspace_name``, ``token``, and its own ``tools/list`` result,
+and the gateway publishes those tools (namespaced
+``{workspace_name}__{app_name}__{tool}`` when a workspace name is supplied, or
+``{app_name}__{tool}`` for old connectors) and routes
 ``tools/call`` back down the same live WebSocket, matching a Future to the
 JSON-RPC id — same dispatch pattern as ``upstream.Upstream``'s local stdio
 reader loop.
@@ -25,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -34,20 +37,37 @@ from .token_store import TokenStore
 log = logging.getLogger("aw-mcp-gateway")
 
 
+def _route_segment(value: str) -> str:
+    segment = re.sub(r"[^0-9A-Za-z_]+", "_", str(value).strip()).strip("_").lower()
+    return segment
+
+
 class RemoteUpstream:
     """One connector's live WebSocket session, providing the same
     ``call_tool(tool, arguments, req_id) -> dict`` interface as the local
     ``Upstream``/``HttpUpstream`` classes so ``Gateway`` can route to it
     identically regardless of transport."""
 
-    def __init__(self, base_name: str, websocket: WebSocket, tools: list[dict], token_id: str):
+    def __init__(self, base_name: str, websocket: WebSocket, tools: list[dict],
+                 token_id: str, workspace_name: str = ""):
         self.base_name = base_name
+        self.workspace_name = workspace_name
         self.app_name = base_name  # may be renamed by Gateway.register_remote on collision
         self.token_id = token_id
         self.websocket = websocket
         self.tools = tools
         self._pending: dict[str, asyncio.Future] = {}
         self.connected_at = time.time()
+
+    @property
+    def route_name(self) -> str:
+        """Namespace used in published tool names and routing table keys."""
+        if not self.workspace_name:
+            return self.app_name
+        workspace = _route_segment(self.workspace_name)
+        if not workspace:
+            return self.app_name
+        return f"{workspace}__{self.app_name}"
 
     async def call_tool(self, tool: str, arguments: dict, req_id) -> dict:
         loop = asyncio.get_event_loop()
@@ -101,6 +121,7 @@ async def link_endpoint(websocket: WebSocket, gateway: "Gateway", token_store: T
             await websocket.close(code=4400, reason="expected a 'register' message first")
             return
         app_name = msg.get("app_name")
+        workspace_name = msg.get("workspace_name") or ""
         tools = msg.get("tools") or []
         if not app_name:
             await websocket.close(code=4400, reason="register message missing app_name")
@@ -117,11 +138,16 @@ async def link_endpoint(websocket: WebSocket, gateway: "Gateway", token_store: T
             log.warning("link token %s scope dropped %d/%d tools for app '%s': %s",
                         link_token.id, len(dropped), len(tools), app_name, sorted(dropped))
 
-        remote = RemoteUpstream(app_name, websocket, scoped_tools, link_token.id)
+        remote = RemoteUpstream(app_name, websocket, scoped_tools, link_token.id, workspace_name)
         gateway.register_remote(remote)
         log.info("remote upstream registered: %s (token=%s, %d tools)",
-                 remote.app_name, link_token.id, len(scoped_tools))
-        await websocket.send_json({"type": "registered", "app_name": remote.app_name})
+                 remote.route_name, link_token.id, len(scoped_tools))
+        await websocket.send_json({
+            "type": "registered",
+            "app_name": remote.app_name,
+            "workspace_name": remote.workspace_name,
+            "route_name": remote.route_name,
+        })
 
         while True:
             raw = await websocket.receive_text()
@@ -137,4 +163,4 @@ async def link_endpoint(websocket: WebSocket, gateway: "Gateway", token_store: T
     finally:
         if remote is not None:
             gateway.unregister_remote(remote)
-            log.info("remote upstream disconnected: %s", remote.app_name)
+            log.info("remote upstream disconnected: %s", remote.route_name)

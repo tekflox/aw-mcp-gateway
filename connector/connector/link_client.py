@@ -23,7 +23,7 @@ log = logging.getLogger("aw-mcp-stdio-wrapper")
 MAX_BACKOFF = 30.0
 
 
-async def run(app_name: str, gateway_url: str, token: str, local: LocalMcp) -> None:
+async def run(app_name: str, workspace_name: str, gateway_url: str, token: str, local: LocalMcp) -> None:
     """Runs forever: connect, register, serve tool calls, reconnect on drop."""
     backoff = 1.0
     url = f"{gateway_url}?token={token}"
@@ -32,7 +32,10 @@ async def run(app_name: str, gateway_url: str, token: str, local: LocalMcp) -> N
             async with websockets.connect(url) as ws:
                 log.info("connected to gateway at %s", gateway_url)
                 await ws.send(json.dumps({
-                    "type": "register", "app_name": app_name, "tools": local.tools,
+                    "type": "register",
+                    "app_name": app_name,
+                    "workspace_name": workspace_name,
+                    "tools": local.tools,
                 }))
                 ack = json.loads(await ws.recv())
                 if ack.get("type") != "registered":

@@ -23,6 +23,13 @@ ECHO_TOOL = {"name": "echo", "description": "", "inputSchema": {"type": "object"
 SHELL_TOOL = {"name": "shell", "description": "", "inputSchema": {"type": "object"}}
 
 
+def _assert_registered(ack, app_name, workspace_name="", route_name=None):
+    assert ack["type"] == "registered"
+    assert ack["app_name"] == app_name
+    assert ack["workspace_name"] == workspace_name
+    assert ack["route_name"] == (route_name or app_name)
+
+
 def test_register_with_unknown_token_is_rejected(gateway_app):
     _gw, _store, app = gateway_app
     with TestClient(app) as client:
@@ -38,7 +45,7 @@ def test_register_publishes_tools_and_routes(gateway_app):
         with client.websocket_connect(f"/link?token={full}") as ws:
             ws.send_json({"type": "register", "app_name": "browser1", "tools": [ECHO_TOOL]})
             ack = ws.receive_json()
-            assert ack == {"type": "registered", "app_name": "browser1"}
+            _assert_registered(ack, "browser1")
             assert "browser1__echo" in gw.routes
             assert "browser1" in gw.remotes
         # disconnected: routes withdrawn, no dead-session routing left behind
@@ -54,7 +61,7 @@ def test_scope_filters_disallowed_tools(gateway_app):
             ws.send_json({"type": "register", "app_name": "toolbox",
                           "tools": [ECHO_TOOL, SHELL_TOOL]})
             ack = ws.receive_json()
-            assert ack == {"type": "registered", "app_name": "toolbox"}
+            _assert_registered(ack, "toolbox")
             assert "toolbox__echo" in gw.routes
             assert "toolbox__shell" not in gw.routes
 
@@ -91,7 +98,7 @@ def test_same_token_reconnect_keeps_same_public_name(gateway_app):
         with client.websocket_connect(f"/link?token={full}") as ws2:
             ws2.send_json({"type": "register", "app_name": "Browser", "tools": [ECHO_TOOL]})
             ack = ws2.receive_json()
-            assert ack == {"type": "registered", "app_name": "Browser"}
+            _assert_registered(ack, "Browser")
             assert "Browser__echo" in gw.routes
             assert "Browser 1" not in gw.remotes  # no bogus renumbering on a plain reconnect
 
@@ -104,15 +111,33 @@ def test_app_name_collision_from_different_tokens_gets_numbered(gateway_app):
         with client.websocket_connect(f"/link?token={full_1}") as ws1:
             ws1.send_json({"type": "register", "app_name": "Browser", "tools": [ECHO_TOOL]})
             ack1 = ws1.receive_json()
-            assert ack1 == {"type": "registered", "app_name": "Browser"}
+            _assert_registered(ack1, "Browser")
 
             with client.websocket_connect(f"/link?token={full_2}") as ws2:
                 ws2.send_json({"type": "register", "app_name": "Browser", "tools": [ECHO_TOOL]})
                 ack2 = ws2.receive_json()
                 # Fred's decision: BOTH get numbered, not `{app}_{server}__{tool}`.
-                assert ack2 == {"type": "registered", "app_name": "Browser 2"}
+                _assert_registered(ack2, "Browser 2")
                 assert "Browser 1" in gw.remotes
                 assert "Browser 2" in gw.remotes
                 assert "Browser 1__echo" in gw.routes
                 assert "Browser 2__echo" in gw.routes
                 assert "Browser" not in gw.remotes
+
+
+def test_workspace_name_prefixes_published_tools(gateway_app):
+    gw, store, app = gateway_app
+    full, _record = store.mint(label="workspace-host")
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/link?token={full}") as ws:
+            ws.send_json({
+                "type": "register",
+                "workspace_name": "Fred Workspace",
+                "app_name": "Browser",
+                "tools": [ECHO_TOOL],
+            })
+            ack = ws.receive_json()
+            _assert_registered(ack, "Browser", "Fred Workspace", "fred_workspace__Browser")
+            assert "fred_workspace__Browser" in gw.remotes
+            assert "fred_workspace__Browser__echo" in gw.routes
+            assert gw.routes["fred_workspace__Browser__echo"] == ("fred_workspace__Browser", "echo")
