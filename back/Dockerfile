@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.source="https://github.com/tekflox/aw-mcp-gateway"
+LABEL org.opencontainers.image.description="Agentic Workspace MCP Gateway"
+LABEL org.opencontainers.image.licenses="MIT"
+
 WORKDIR /app
 
 COPY requirements.txt .

@@ -1,9 +1,10 @@
 name: Publish gateway image
 
 # Builds the gateway server (back/) and pushes it to ghcr.io/<owner>/aw-mcp-gateway.
-# The workflow-scoped GITHUB_TOKEN provides packages:write, so no external
-# credential is needed. Manual trigger only (no automatic GHA runs — cost/
-# quota conscious, mirrors tekflox/aw-app-browser's build.yml).
+# Uses GHCR_PAT when configured so the workflow can update an existing org
+# package that was first published outside this repo; otherwise falls back to
+# the workflow-scoped GITHUB_TOKEN. Manual trigger only (no automatic GHA runs —
+# cost/quota conscious, mirrors tekflox/aw-app-browser's build.yml).
 #
 #   gh workflow run publish.yml                        # amd64
 #   gh workflow run publish.yml -f include_arm64=true  # + linux/arm64 (QEMU)
@@ -42,7 +43,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       # ghcr.io rejects mixed-case namespaces — lowercase the owner login.
       - name: Lowercase repo owner
@@ -68,6 +69,10 @@ jobs:
           tags: |
             ghcr.io/${{ steps.owner.outputs.lc }}/aw-mcp-gateway:latest
             ghcr.io/${{ steps.owner.outputs.lc }}/aw-mcp-gateway:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Agentic Workspace MCP Gateway
+            org.opencontainers.image.licenses=MIT
           cache-from: type=registry,ref=ghcr.io/${{ steps.owner.outputs.lc }}/aw-mcp-gateway:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ steps.owner.outputs.lc }}/aw-mcp-gateway:buildcache,mode=max
 
