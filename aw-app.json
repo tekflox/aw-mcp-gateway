@@ -10,7 +10,14 @@
 
   "runtime": {
     "image": "ghcr.io/tekflox/aw-mcp-gateway:latest",
-    "port": 9200
+    "port": 9200,
+    "env": {
+      "AW_APP_SCAN_ROOTS": "/workspace/apps"
+    },
+    "volumes": [
+      { "source": "back/config", "target": "/app/config", "mode": "rw" },
+      { "source": "$AW_APPS_ROOT", "target": "/workspace/apps", "mode": "ro" }
+    ]
   },
 
   "permissions": [
@@ -21,7 +28,26 @@
 
   "config_schema": {
     "type": "object",
-    "properties": {},
+    "properties": {
+      "auto_start": {
+        "type": "boolean",
+        "default": true,
+        "title": "Auto-start",
+        "description": "Start the MCP Gateway container when the workspace starts."
+      },
+      "auth_required": {
+        "type": "boolean",
+        "default": true,
+        "title": "Authentication required",
+        "description": "Require workspace authentication for the gateway admin and MCP endpoints."
+      },
+      "public": {
+        "type": "boolean",
+        "default": false,
+        "title": "Public",
+        "description": "Expose the gateway through the workspace public routing layer."
+      }
+    },
     "required": []
   },
 

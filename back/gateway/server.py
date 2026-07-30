@@ -235,6 +235,11 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
         if authorization != expected:
             raise HTTPException(status_code=401, detail="missing or invalid bearer token")
 
+    def _check_admin_auth(authorization: str | None, workspace_identity: str | None) -> None:
+        if workspace_identity:
+            return
+        _check_auth(authorization)
+
     async def _dispatch(handler, request: Request, authorization: str | None) -> Response:
         _check_auth(authorization)
         body = await request.json()
@@ -277,6 +282,32 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
     async def list_link_tokens(authorization: str | None = Header(default=None)):
         _check_auth(authorization)
         return {"tokens": [t.public_dict() for t in token_store.list()]}
+
+    @app.get("/admin/config")
+    async def get_config(
+        authorization: str | None = Header(default=None),
+        workspace_identity: str | None = Header(default=None, alias="X-AW-Identity-Sub"),
+    ):
+        _check_admin_auth(authorization, workspace_identity)
+        return config.effective_mcp_config(write_final=True)
+
+    @app.put("/admin/config")
+    async def put_config(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        workspace_identity: str | None = Header(default=None, alias="X-AW-Identity-Sub"),
+    ):
+        _check_admin_auth(authorization, workspace_identity)
+        body = await request.json()
+        custom = body.get("custom") if isinstance(body, dict) else None
+        if custom is None:
+            custom = body
+        if not isinstance(custom, dict):
+            return JSONResponse({"error": "custom config must be an object"}, status_code=400)
+        config.save_custom_mcp_config(custom)
+        payload = config.effective_mcp_config(write_final=True)
+        payload["restart_required"] = True
+        return payload
 
     @app.post("/link-tokens")
     async def mint_link_token(request: Request, authorization: str | None = Header(default=None)):
