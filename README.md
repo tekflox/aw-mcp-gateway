@@ -4,13 +4,9 @@ A **standalone, public** app that exposes stdio MCP servers over Streamable
 HTTP — one gateway, reachable by any HTTP-capable client (models, other
 apps), fronting a pool of local and remote MCP upstreams.
 
-This is the standalone twin of
-[`src/mcp/gateway.py`](https://github.com/tekflox/agentic-workspace) in the
-main Agentic Workspace (AW) repo. That in-repo gateway keeps running
-unchanged for now — this repo is a scaffold that ports its logic out into a
-publishable, independently-deployable app, as the first step toward apps that
-run on a user's own machine (BYOD) needing a single place to reach MCP tools
-without every app spawning its own stdio children. See the design notes in
+This repository packages the AW MCP gateway as a publishable,
+independently-deployable app for environments that need one HTTP endpoint for
+local and remote MCP tools. See the design notes in
 [Architecture](#architecture) below.
 
 ## Why public
@@ -51,10 +47,9 @@ connector/    aw-mcp-stdio-wrapper — runs a stdio MCP elsewhere and dials
 * **`back/`** owns the upstream pool. Three kinds:
   * **Local** — a stdio MCP child it spawns itself (`Upstream` in
     `back/gateway/upstream.py`), or an already-HTTP upstream it proxies to
-    (`HttpUpstream`). Direct port of the in-repo gateway's
-    `Upstream`/`HttpUpstream`/`Gateway`/`build_app` — same reader-loop/
-    Future-dispatch design, same allowlist + named-config (`ConfigGateway`)
-    scoping.
+    (`HttpUpstream`). Uses the same reader-loop/Future-dispatch design,
+    allowlist handling, and named-config (`ConfigGateway`) scoping as AW's
+    gateway implementation.
   * **Gateway** (federation) — `GatewayUpstream` (`back/gateway/upstream.py`,
     extends `HttpUpstream`) makes *another* aw-mcp-gateway an upstream of
     this one: its entire tool pool gets aggregated in, one namespace level
@@ -169,18 +164,11 @@ python3 -m connector.main
 
 | Part | Real | Stub / TODO |
 |---|---|---|
-| `back/` local upstreams (stdio + HTTP) | Full port of the in-repo gateway's `Upstream`/`HttpUpstream`/`Gateway`/`ConfigGateway` | Per-profile run-policy/approval-gate/KB-scoping hooks from the in-repo version were intentionally dropped — those are agentic-workspace-specific, not part of the generic gateway |
+| `back/` local upstreams (stdio + HTTP) | Full local upstream support with `Upstream`/`HttpUpstream`/`Gateway`/`ConfigGateway` | Per-profile run-policy/approval-gate/KB-scoping hooks are outside this generic gateway |
 | `back/` gateway↔gateway federation (`type: gateway`) | `GatewayUpstream` aggregates a remote gateway's whole tool pool, with cycle detection + depth cap enforced against the remote's `/healthz`, verified end to end against a real second `uvicorn` instance | Cycle/depth checks are point-in-time (at connect), not re-validated if the federation graph changes later without a restart/reconnect |
 | `back/` `/link` remote registration | Real `awlk_...` token (SHA-256 hash, `TokenStore`), glob scope enforcement, numbered app-name collisions, reconnect-safe by token identity — all verified end to end | `TokenStore` only has a `FileTokenStore` impl (plain JSON) — swap in the Postgres-backed one once the data-plane DB exists; a disconnected app's name slot is held forever (not freed for reuse by an unrelated app) |
 | `connector/` | Spawns a local stdio MCP and dials/registers/serves calls over `/link`, with reconnect+backoff, verified end to end | One MCP per connector instance (no multi-MCP fan-in) |
 | `front/` | Builds; Status shows live health; Upstreams lists local/remote/federated with connected status; Hosts & Apps mints/lists/revokes real link tokens (paste the gateway bearer token in) | No separate admin session/login — the bearer token is typed in ad hoc each time |
-
-## Do not touch the in-repo gateway
-
-This scaffold **ports** `src/mcp/gateway.py`'s logic out of the main
-`agentic-workspace` repo — it does not replace it. The in-repo gateway
-keeps running as-is; migrating real traffic over to this standalone app is a
-separate, later step.
 
 ## CI
 
