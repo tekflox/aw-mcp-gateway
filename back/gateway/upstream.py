@@ -42,6 +42,7 @@ class Upstream:
 
     def __init__(self, name: str, spec: dict):
         self.name = name
+        self.spec = spec
         self.command: str = spec["command"]
         self.args: list[str] = spec.get("args", [])
         self.env_extra: dict = spec.get("env", {})
@@ -170,12 +171,37 @@ class Upstream:
                 "isError": True}}
         return resp
 
+    async def stop(self) -> None:
+        """Tear down the child process + reader task — used by Gateway.reload()
+        when a server is removed/disabled or its spec changed, so the old
+        process doesn't leak."""
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._reader_task = None
+        if self.proc is not None and self.proc.returncode is None:
+            self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+                await self.proc.wait()
+        self.proc = None
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(RuntimeError(f"upstream '{self.name}' stopped"))
+        self._pending.clear()
+
 
 class HttpUpstream:
     """An HTTP MCP upstream — proxies JSON-RPC tool calls to a Streamable HTTP endpoint."""
 
     def __init__(self, name: str, spec: dict):
         self.name = name
+        self.spec = spec
         self.url: str = spec["url"]
         self._extra_headers: dict[str, str] = spec.get("headers", {}) or {}
         self.tools: list[dict] = []
@@ -241,6 +267,11 @@ class HttpUpstream:
                              "text": f"http upstream '{self.name}' error: {exc}"}],
                 "isError": True}}
 
+    async def stop(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
 
 class FederationCycleError(RuntimeError):
     """Raised when connecting a ``GatewayUpstream`` would close a loop back
@@ -282,9 +313,16 @@ class GatewayUpstream(HttpUpstream):
     """
 
     def __init__(self, name: str, spec: dict, own_gateway_id: str, max_depth: int):
+        original_spec = spec
         if spec.get("token") and "headers" not in spec:
             spec = {**spec, "headers": {"Authorization": f"Bearer {spec['token']}"}}
         super().__init__(name, spec)
+        # Keep the ORIGINAL (pre-header-injection) spec for Gateway.reload()'s
+        # diffing — otherwise this upstream would never compare equal to its
+        # own freshly-reloaded spec (config never has the injected `headers`
+        # key) and would be needlessly torn down + reconnected on every
+        # reload even when nothing about it actually changed.
+        self.spec = original_spec
         self.own_gateway_id = own_gateway_id
         self.max_depth = max_depth
         self.remote_gateway_id: str | None = None

@@ -163,3 +163,97 @@ def test_admin_config_get_returns_gateway_bearer_token(tmp_path, monkeypatch):
 
     assert res.status_code == 200
     assert res.json()["token"] == "top-secret-token"
+
+
+ECHO_SPEC = {
+    "type": "stdio", "command": "python3",
+    "args": ["-m", "gateway.examples.echo_server"], "enabled": True,
+}
+
+
+def _setup_reload_paths(tmp_path, monkeypatch, apps: dict):
+    """Write each {app_name: {server_name: spec}} as that app's mcp.json
+    under a fresh scan root, and point config at fresh mcp.json/custom.json
+    paths — the standard fixture shape for every reload() test below."""
+    apps_root = tmp_path / "apps"
+    for app_name, servers in apps.items():
+        _write_json(apps_root / app_name / "mcp.json", {"mcpServers": servers})
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps_root))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(tmp_path / "mcp.custom.json"))
+
+
+async def test_reload_starts_a_newly_added_server(tmp_path, monkeypatch):
+    _setup_reload_paths(tmp_path, monkeypatch, {"app-a": {}})
+    gw = Gateway(["echo"])
+    await gw.start()
+    assert gw.upstreams == {}
+
+    _setup_reload_paths(tmp_path, monkeypatch, {"app-a": {"echo": ECHO_SPEC}})
+    result = await gw.reload()
+
+    assert result["added"] == ["echo"]
+    assert result["removed"] == [] and result["changed"] == [] and result["failed"] == []
+    assert "echo" in gw.upstreams
+    assert "echo__echo" in gw.routes
+
+
+async def test_reload_stops_a_removed_server_and_drops_its_routes(tmp_path, monkeypatch):
+    _setup_reload_paths(tmp_path, monkeypatch, {"app-a": {"echo": ECHO_SPEC}})
+    gw = Gateway(["echo"])
+    await gw.start()
+    assert "echo" in gw.upstreams
+    old_upstream = gw.upstreams["echo"]
+
+    _setup_reload_paths(tmp_path, monkeypatch, {"app-a": {}})
+    result = await gw.reload()
+
+    assert result["removed"] == ["echo"]
+    assert "echo" not in gw.upstreams
+    assert "echo__echo" not in gw.routes
+    assert old_upstream.proc is None  # stopped
+
+
+async def test_reload_restarts_a_server_whose_spec_changed(tmp_path, monkeypatch):
+    _setup_reload_paths(tmp_path, monkeypatch, {"app-a": {"echo": ECHO_SPEC}})
+    gw = Gateway(["echo"])
+    await gw.start()
+    old_upstream = gw.upstreams["echo"]
+
+    changed_spec = {**ECHO_SPEC, "env": {"SOME_FLAG": "1"}}
+    _setup_reload_paths(tmp_path, monkeypatch, {"app-a": {"echo": changed_spec}})
+    result = await gw.reload()
+
+    assert result["changed"] == ["echo"]
+    assert gw.upstreams["echo"] is not old_upstream  # torn down + rebuilt
+    assert "echo__echo" in gw.routes
+
+
+async def test_reload_leaves_an_unchanged_server_running_untouched(tmp_path, monkeypatch):
+    _setup_reload_paths(tmp_path, monkeypatch, {"app-a": {"echo": ECHO_SPEC}})
+    gw = Gateway(["echo"])
+    await gw.start()
+    old_upstream = gw.upstreams["echo"]
+
+    # Same spec, re-scanned from disk (a fresh dict, same content).
+    _setup_reload_paths(tmp_path, monkeypatch, {"app-a": {"echo": dict(ECHO_SPEC)}})
+    result = await gw.reload()
+
+    assert result["unchanged"] == ["echo"]
+    assert result["added"] == [] and result["removed"] == [] and result["changed"] == []
+    assert gw.upstreams["echo"] is old_upstream  # same process, not restarted
+
+
+def test_reload_endpoint_requires_admin_auth(tmp_path, monkeypatch):
+    _setup_reload_paths(tmp_path, monkeypatch, {"app-a": {}})
+    app = build_app(Gateway([]), "top-secret-token", {})
+    with TestClient(app) as client:
+        unauth = client.post("/reload")
+        assert unauth.status_code == 401
+
+        via_bearer = client.post("/reload", headers={"Authorization": "Bearer top-secret-token"})
+        assert via_bearer.status_code == 200
+        assert via_bearer.json()["upstreams"] == []
+
+        via_identity = client.post("/reload", headers={"X-AW-Identity-Sub": "system"})
+        assert via_identity.status_code == 200

@@ -70,28 +70,99 @@ class Gateway:
     async def start(self) -> None:
         specs = self._load_specs()
         for name, spec in specs.items():
-            kind = spec.get("type", "stdio")
-            up: Upstream | HttpUpstream | GatewayUpstream
-            if kind == "gateway":
-                up = GatewayUpstream(name, spec, self.gateway_id, self.max_federation_depth)
-            elif kind == "http":
-                up = HttpUpstream(name, spec)
-            else:
-                up = Upstream(name, spec)
-            try:
-                await up.start()
-            except (FederationCycleError, FederationDepthExceeded) as exc:
-                log.error("federation upstream '%s' rejected: %s", name, exc)
+            error = await self._start_one(name, spec)
+            if error:
                 continue
-            except Exception:
-                log.exception("failed to start upstream %s", name)
-                continue
-            self.upstreams[name] = up
-            for tool in up.tools:
-                self._add_route(name, tool)
-            log.info("upstream %s (%s) — %d tools", name, kind, len(up.tools))
+            log.info("upstream %s (%s) — %d tools", name, spec.get("type", "stdio"),
+                     len(self.upstreams[name].tools))
         log.info("gateway ready: %d local upstreams, %d tools",
                  len(self.upstreams), len(self.agg_tools))
+
+    async def _start_one(self, name: str, spec: dict) -> str | None:
+        """Construct, start, and register ONE local upstream. Returns an
+        error string on failure (already logged), None on success — shared
+        by start() (every upstream, at boot) and reload() (only the
+        added/changed ones)."""
+        kind = spec.get("type", "stdio")
+        up: Upstream | HttpUpstream | GatewayUpstream
+        if kind == "gateway":
+            up = GatewayUpstream(name, spec, self.gateway_id, self.max_federation_depth)
+        elif kind == "http":
+            up = HttpUpstream(name, spec)
+        else:
+            up = Upstream(name, spec)
+        try:
+            await up.start()
+        except (FederationCycleError, FederationDepthExceeded) as exc:
+            log.error("federation upstream '%s' rejected: %s", name, exc)
+            return str(exc)
+        except Exception as exc:
+            log.exception("failed to start upstream %s", name)
+            return str(exc)
+        self.upstreams[name] = up
+        for tool in up.tools:
+            self._add_route(name, tool)
+        return None
+
+    def _drop_local_routes(self, server: str) -> None:
+        """Remove every published route/tool that dispatches to `server` —
+        the local-upstream counterpart of _withdraw_remote(), used by
+        reload() before restarting/removing a local upstream so stale
+        routes don't linger pointing at a torn-down or replaced process."""
+        self.agg_tools = [t for t in self.agg_tools
+                          if self.routes.get(t["name"], ("",))[0] != server]
+        self.routes = {k: v for k, v in self.routes.items() if v[0] != server}
+
+    async def reload(self) -> dict:
+        """Re-scan config/mcp.json (apps + config/mcp.custom.json) and
+        reconcile the running local upstreams to match it — WITHOUT
+        restarting the gateway process itself, so in-flight federation
+        (remote upstreams, /link connectors) is undisturbed.
+
+        Diffs old vs new specs by name:
+        * removed (no longer in config) — stopped, routes dropped.
+        * changed (same name, different spec — e.g. an app's settings
+          save changed its mcp.json) — stopped then restarted fresh.
+        * added (new name) — started fresh.
+        * unchanged — left running as-is, no reconnect churn.
+
+        Called by aw-workspace after an app with `contributes.mcp: true`
+        saves its config (that app is expected to have already rewritten
+        its own mcp.json to disk BEFORE this fires) — see aw-workspace's
+        save_app_config route.
+        """
+        new_specs = self._load_specs()
+        old_names = set(self.upstreams)
+        new_names = set(new_specs)
+
+        removed = old_names - new_names
+        added = new_names - old_names
+        common = old_names & new_names
+        changed = {n for n in common if self.upstreams[n].spec != new_specs[n]}
+        unchanged = common - changed
+
+        for name in removed | changed:
+            up = self.upstreams.pop(name, None)
+            if up is not None:
+                await up.stop()
+            self._drop_local_routes(name)
+
+        failed: list[dict] = []
+        for name in sorted(added | changed):
+            error = await self._start_one(name, new_specs[name])
+            if error:
+                failed.append({"name": name, "error": error})
+
+        log.info("gateway reload: +%d -%d ~%d changed, %d unchanged, %d failed — "
+                 "%d local upstreams, %d tools now",
+                 len(added), len(removed), len(changed), len(unchanged), len(failed),
+                 len(self.upstreams), len(self.agg_tools))
+        return {
+            "added": sorted(added), "removed": sorted(removed),
+            "changed": sorted(changed), "unchanged": sorted(unchanged),
+            "failed": failed,
+            "upstreams": sorted(self.upstreams), "tools": len(self.agg_tools),
+        }
 
     def _add_route(self, server: str, tool: dict) -> None:
         # `server` stays the real dispatch key (self.upstreams/self.remotes
@@ -322,6 +393,24 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
         payload["restart_required"] = True
         payload["token"] = token
         return payload
+
+    @app.post("/reload")
+    async def reload_upstreams(
+        authorization: str | None = Header(default=None),
+        workspace_identity: str | None = Header(default=None, alias="X-AW-Identity-Sub"),
+    ):
+        """Hot-reload local upstreams from disk — no process restart, no
+        "restart_required" left dangling for the caller to act on later.
+        Same admin auth as /admin/config (bearer, or the trusted
+        X-AW-Identity-Sub header aw-workspace's own internal calls carry).
+
+        The intended caller is aw-workspace right after an app with
+        contributes.mcp: true saves its config: that app rewrites its own
+        mcp.json to disk FIRST, then aw-workspace calls this directly on
+        the container's internal address (no public hairpin through this
+        app's own reverse-proxy route)."""
+        _check_admin_auth(authorization, workspace_identity)
+        return await gateway.reload()
 
     @app.post("/link-tokens")
     async def mint_link_token(request: Request, authorization: str | None = Header(default=None)):
