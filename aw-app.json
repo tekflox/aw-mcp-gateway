@@ -39,7 +39,7 @@
         "type": "boolean",
         "default": true,
         "title": "Authentication required",
-        "description": "Require workspace authentication for the gateway admin and MCP endpoints."
+        "description": "Require workspace authentication for the gateway admin and MCP endpoints. Turning this off does not disable auth entirely — your identity still gets forwarded when you're logged in, but a caller without one is now let through for the gateway's own bearer-token check to decide, instead of being blocked at this layer. Turn off to allow external bearer-token-only callers (combine with Public)."
       },
       "public": {
         "type": "boolean",
