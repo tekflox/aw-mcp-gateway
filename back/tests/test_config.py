@@ -87,6 +87,69 @@ def test_admin_config_accepts_workspace_identity_header(tmp_path, monkeypatch):
     assert res.json()["final"] == {"mcpServers": {}}
 
 
+def test_workspace_name_prefers_gateway_json_over_env(tmp_path, monkeypatch):
+    gw_json = tmp_path / "gateway.json"
+    _write_json(gw_json, {"workspace_name": "configured-ws"})
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
+    monkeypatch.setenv("AW_WORKSPACE_SLUG", "env-ws")
+    assert config.workspace_name() == "configured-ws"
+
+
+def test_workspace_name_falls_back_to_env_var(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+    monkeypatch.setenv("AW_WORKSPACE_SLUG", "env-ws")
+    assert config.workspace_name() == "env-ws"
+
+
+def test_workspace_name_empty_when_neither_set(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+    monkeypatch.delenv("AW_WORKSPACE_SLUG", raising=False)
+    assert config.workspace_name() == ""
+
+
+async def test_local_upstream_tool_names_are_namespaced_by_workspace(tmp_path, monkeypatch):
+    custom_path = tmp_path / "mcp.custom.json"
+    _write_json(custom_path, {"mcpServers": {
+        "example-echo": {"type": "stdio", "command": "python3",
+                          "args": ["-m", "gateway.examples.echo_server"], "enabled": True},
+    }})
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(tmp_path / "apps"))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(custom_path))
+
+    gw = Gateway(["example-echo"], workspace_name="fredericowu")
+    await gw.start()
+
+    assert "example-echo" in gw.upstreams  # dispatch key stays unprefixed
+    assert "fredericowu__example_echo__echo" in gw.routes
+    assert gw.routes["fredericowu__example_echo__echo"] == ("example-echo", "echo")
+    names = [t["name"] for t in gw.agg_tools]
+    assert "fredericowu__example_echo__echo" in names
+    assert "example_echo__echo" not in names
+
+    resp = await gw.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "fredericowu__example_echo__echo", "arguments": {"text": "hi"}},
+    })
+    assert resp["result"]["content"][0]["text"] == "hi"
+
+
+async def test_local_upstream_tool_names_unprefixed_without_workspace_name(tmp_path, monkeypatch):
+    custom_path = tmp_path / "mcp.custom.json"
+    _write_json(custom_path, {"mcpServers": {
+        "example-echo": {"type": "stdio", "command": "python3",
+                          "args": ["-m", "gateway.examples.echo_server"], "enabled": True},
+    }})
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(tmp_path / "apps"))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(custom_path))
+
+    gw = Gateway(["example-echo"], workspace_name="")
+    await gw.start()
+
+    assert "example_echo__echo" in gw.routes
+
+
 def test_admin_config_get_returns_gateway_bearer_token(tmp_path, monkeypatch):
     final_path = tmp_path / "gateway" / "mcp.json"
     custom_path = tmp_path / "gateway" / "mcp.custom.json"

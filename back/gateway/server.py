@@ -34,10 +34,13 @@ DEFAULT_ALLOW: list[str] = []  # empty = nothing local unless config/mcp.json + 
 
 
 class Gateway:
-    def __init__(self, allow: list[str], gateway_id: str | None = None, max_federation_depth: int | None = None):
+    def __init__(self, allow: list[str], gateway_id: str | None = None, max_federation_depth: int | None = None,
+                 workspace_name: str | None = None):
         self.allow = allow
         self.gateway_id = gateway_id or config.gateway_id()
         self.max_federation_depth = max_federation_depth or config.max_federation_depth()
+        # Namespaces every published tool name — see config.workspace_name().
+        self.workspace_name = workspace_name if workspace_name is not None else config.workspace_name()
         self.upstreams: dict[str, Upstream | HttpUpstream | GatewayUpstream] = {}
         self.remotes: dict[str, RemoteUpstream] = {}  # public route_name -> RemoteUpstream (live only)
         self.routes: dict[str, tuple[str, str]] = {}  # public name -> (server, tool)
@@ -91,7 +94,11 @@ class Gateway:
                  len(self.upstreams), len(self.agg_tools))
 
     def _add_route(self, server: str, tool: dict) -> None:
-        public = public_name(server, tool["name"])
+        # `server` stays the real dispatch key (self.upstreams/self.remotes
+        # lookup) — the workspace prefix only decorates the PUBLIC name, so
+        # routing is unaffected by whether workspace_name is set.
+        display_server = f"{self.workspace_name}__{server}" if self.workspace_name else server
+        public = public_name(display_server, tool["name"])
         t = dict(tool)
         t["name"] = public
         t["description"] = f"[{server}] {t.get('description', '')}".strip()

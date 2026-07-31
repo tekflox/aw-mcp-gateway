@@ -171,6 +171,23 @@ def gateway_id() -> str:
     return secrets.token_hex(8)
 
 
+def workspace_name() -> str:
+    """Slug of the aw-workspace this gateway runs inside — every published
+    tool name is namespaced under it (``{workspace}__{server}__{tool}``) so
+    tools from different workspaces never collide once aggregated by a
+    client, or federated further downstream by another gateway.
+
+    Prefers an explicit ``workspace_name`` in ``config/gateway.json``; falls
+    back to the ``AW_WORKSPACE_SLUG`` env var aw-workspace injects into every
+    container app it runs (see aw-workspace's ``ContainerRuntime.run``).
+    Empty when neither is set — tool names stay unprefixed, same as before
+    this existed (a bare local dev checkout has no workspace to name)."""
+    configured = (load_gateway_config().get("workspace_name") or "").strip()
+    if configured:
+        return configured
+    return (os.environ.get("AW_WORKSPACE_SLUG") or "").strip()
+
+
 def token() -> str:
     """Bearer token — sourced from ``config/gateway.json``'s ``token`` field.
 
