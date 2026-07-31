@@ -3,13 +3,13 @@
   "id": "mcp-gateway",
   "name": "MCP Gateway",
   "version": "0.2.0",
-  "description": "Federated MCP gateway as a Tier-2 (container) app: exposes stdio MCP servers over Streamable HTTP + a /link WebSocket for gateway-to-gateway federation (flat namespace, first-registered-wins, per-peer tokens, federation-depth limit). Built from this repo's back/gateway/ (server.py, upstream.py, remote_upstream.py, token_store.py), image published by this repo's .github/workflows/publish.yml. ADDITIVE: coexists with the monolith's src/mcp/gateway.py (in-repo, profiles + /lazy) \u2014 this app federates only; the in-repo gateway is strangled later once this reaches parity (see docs/knowledge_base/architecture/mcp-gateway-app-federation.md).",
+  "description": "Share your workspace's tools with any AI agent, and reach tools from other workspaces in return. Install MCP Gateway and every tool your other apps expose becomes instantly callable \u2014 no per-app setup. Connect it to another gateway to pull in that workspace's tools too, with per-connection access tokens you control.",
   "tier": "container",
   "publisher": "TekFlox",
   "resource_estimate": {
     "cpu": "low",
     "memory": "~150 MB",
-    "disk": "~200 MB (prebuilt image)"
+    "disk": "~200 MB"
   },
   "runtime": {
     "image": "ghcr.io/tekflox/aw-mcp-gateway:latest",
