@@ -289,7 +289,13 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
         workspace_identity: str | None = Header(default=None, alias="X-AW-Identity-Sub"),
     ):
         _check_admin_auth(authorization, workspace_identity)
-        return config.effective_mcp_config(write_final=True)
+        payload = config.effective_mcp_config(write_final=True)
+        # The gateway's own root bearer token — same value that gates /mcp,
+        # /link-tokens, etc. via _check_auth. Surfaced here (read-only) so the
+        # admin UI can show/copy it without a second privileged endpoint.
+        # Gated by the same admin auth as the rest of this route.
+        payload["token"] = token
+        return payload
 
     @app.put("/admin/config")
     async def put_config(
@@ -307,6 +313,7 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
         config.save_custom_mcp_config(custom)
         payload = config.effective_mcp_config(write_final=True)
         payload["restart_required"] = True
+        payload["token"] = token
         return payload
 
     @app.post("/link-tokens")
