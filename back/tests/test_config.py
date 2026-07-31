@@ -66,6 +66,7 @@ def test_admin_config_endpoint_saves_custom_and_rebuilds_final(tmp_path, monkeyp
     assert body["restart_required"] is True
     assert body["final"]["mcpServers"]["scanned"]["command"] == "scan"
     assert body["final"]["mcpServers"]["custom"]["command"] == "mine"
+    assert body["token"] == "secret"
     assert json.loads(custom_path.read_text()) == {
         "mcpServers": {"custom": {"command": "mine", "type": "stdio"}}
     }
@@ -84,3 +85,18 @@ def test_admin_config_accepts_workspace_identity_header(tmp_path, monkeypatch):
 
     assert res.status_code == 200
     assert res.json()["final"] == {"mcpServers": {}}
+
+
+def test_admin_config_get_returns_gateway_bearer_token(tmp_path, monkeypatch):
+    final_path = tmp_path / "gateway" / "mcp.json"
+    custom_path = tmp_path / "gateway" / "mcp.custom.json"
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(tmp_path / "apps"))
+    monkeypatch.setattr(config, "MCP_JSON", str(final_path))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(custom_path))
+
+    app = build_app(Gateway([]), "top-secret-token", {})
+    with TestClient(app) as client:
+        res = client.get("/admin/config", headers={"Authorization": "Bearer top-secret-token"})
+
+    assert res.status_code == 200
+    assert res.json()["token"] == "top-secret-token"
