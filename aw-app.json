@@ -2,12 +2,15 @@
   "manifest_version": 1,
   "id": "mcp-gateway",
   "name": "MCP Gateway",
-  "version": "0.1.0",
-  "description": "Federated MCP gateway as a Tier-2 (container) app: exposes stdio MCP servers over Streamable HTTP + a /link WebSocket for gateway-to-gateway federation (flat namespace, first-registered-wins, per-peer tokens, federation-depth limit). Built from this repo's back/gateway/ (server.py, upstream.py, remote_upstream.py, token_store.py), image published by this repo's .github/workflows/publish.yml. ADDITIVE: coexists with the monolith's src/mcp/gateway.py (in-repo, profiles + /lazy) — this app federates only; the in-repo gateway is strangled later once this reaches parity (see docs/knowledge_base/architecture/mcp-gateway-app-federation.md).",
+  "version": "0.2.0",
+  "description": "Federated MCP gateway as a Tier-2 (container) app: exposes stdio MCP servers over Streamable HTTP + a /link WebSocket for gateway-to-gateway federation (flat namespace, first-registered-wins, per-peer tokens, federation-depth limit). Built from this repo's back/gateway/ (server.py, upstream.py, remote_upstream.py, token_store.py), image published by this repo's .github/workflows/publish.yml. ADDITIVE: coexists with the monolith's src/mcp/gateway.py (in-repo, profiles + /lazy) \u2014 this app federates only; the in-repo gateway is strangled later once this reaches parity (see docs/knowledge_base/architecture/mcp-gateway-app-federation.md).",
   "tier": "container",
   "publisher": "TekFlox",
-  "resource_estimate": { "cpu": "low", "memory": "~150 MB", "disk": "~200 MB (prebuilt image)" },
-
+  "resource_estimate": {
+    "cpu": "low",
+    "memory": "~150 MB",
+    "disk": "~200 MB (prebuilt image)"
+  },
   "runtime": {
     "image": "ghcr.io/tekflox/aw-mcp-gateway:latest",
     "port": 9200,
@@ -15,17 +18,22 @@
       "AW_APP_SCAN_ROOTS": "/workspace/apps"
     },
     "volumes": [
-      { "source": "back/config", "target": "/app/config", "mode": "rw" },
-      { "source": "$AW_APPS_ROOT", "target": "/workspace/apps", "mode": "ro" }
+      {
+        "source": "back/config",
+        "target": "/app/config",
+        "mode": "rw"
+      },
+      {
+        "source": "$AW_APPS_ROOT",
+        "target": "/workspace/apps",
+        "mode": "ro"
+      }
     ]
   },
-
   "permissions": [
     "containers:manage"
   ],
-
   "contributes": {},
-
   "config_schema": {
     "type": "object",
     "properties": {
@@ -39,7 +47,7 @@
         "type": "boolean",
         "default": true,
         "title": "Authentication required",
-        "description": "Require workspace authentication for the gateway admin and MCP endpoints. Turning this off does not disable auth entirely — your identity still gets forwarded when you're logged in, but a caller without one is now let through for the gateway's own bearer-token check to decide, instead of being blocked at this layer. Turn off to allow external bearer-token-only callers (combine with Public)."
+        "description": "Require workspace authentication for the gateway admin and MCP endpoints. Turning this off does not disable auth entirely \u2014 your identity still gets forwarded when you're logged in, but a caller without one is now let through for the gateway's own bearer-token check to decide, instead of being blocked at this layer. Turn off to allow external bearer-token-only callers (combine with Public)."
       },
       "public": {
         "type": "boolean",
@@ -50,8 +58,6 @@
     },
     "required": []
   },
-
   "dependencies": {},
-
   "migrations": {}
 }
