@@ -42,6 +42,34 @@ def test_effective_mcp_config_scans_apps_and_custom_overrides(tmp_path, monkeypa
     assert json.loads(final_path.read_text()) == payload["final"]
 
 
+def test_load_specs_auto_trusts_scanned_servers_without_an_allowlist_entry(tmp_path, monkeypatch):
+    """Installing an app is enough on its own — Gateway._load_specs() must
+    start its contributed (scanned) server even with an empty self.allow.
+    Only hand-authored mcp.custom.json entries still need an explicit
+    allowlist entry (they aren't reviewed by the app install flow)."""
+    apps = tmp_path / "apps"
+    custom_path = tmp_path / "gateway" / "mcp.custom.json"
+    _write_json(apps / "some-app" / "mcp.json", {
+        "mcpServers": {"scanned-app": {"type": "stdio", "command": "from-scan"}}
+    })
+    _write_json(custom_path, {
+        "mcpServers": {"hand-authored": {"type": "stdio", "command": "from-custom"}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "gateway" / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(custom_path))
+
+    gw = Gateway([])  # empty allowlist — nothing manually approved
+    specs = gw._load_specs()
+
+    assert "scanned-app" in specs  # auto-trusted, no allow entry needed
+    assert "hand-authored" not in specs  # custom entry still gated
+
+    gw.allow = ["hand-authored"]
+    specs = gw._load_specs()
+    assert "hand-authored" in specs
+
+
 def test_admin_config_endpoint_saves_custom_and_rebuilds_final(tmp_path, monkeypatch):
     apps = tmp_path / "apps"
     final_path = tmp_path / "gateway" / "mcp.json"

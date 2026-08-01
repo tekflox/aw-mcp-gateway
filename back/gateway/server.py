@@ -50,12 +50,25 @@ class Gateway:
         self._remote_name_groups: dict[str, list[str]] = {}  # workspace+base_name -> [token_id, ...] order
 
     def _load_specs(self) -> dict[str, dict]:
+        """Which upstreams actually get started.
+
+        Two trust paths, so installing an app is enough on its own —
+        no manual ``gateway.json`` edit required:
+
+        * **scanned** — every server discovered by ``config.scan_app_mcp_servers()``
+          under ``AW_APP_SCAN_ROOTS`` (i.e. contributed by an app the
+          workspace's own install flow already vetted through
+          permissions/dependencies) is auto-trusted and always loaded.
+        * **custom** — anything only present via ``config/mcp.custom.json``
+          (hand-authored, not reviewed by the app framework) still needs
+          an explicit ``self.allow`` entry — the one remaining use of the
+          allowlist.
+        """
         servers = config.load_mcp_servers()
+        scanned, _sources = config.scan_app_mcp_servers()
         out = {}
-        for name in self.allow:
-            spec = servers.get(name)
-            if not spec:
-                log.warning("allowlisted upstream '%s' not found in config/mcp.json", name)
+        for name, spec in servers.items():
+            if name not in scanned and name not in self.allow:
                 continue
             if spec.get("enabled") is False:
                 log.warning("upstream '%s' is disabled in config/mcp.json — skipping", name)
@@ -65,6 +78,9 @@ class Gateway:
                 log.warning("upstream '%s' has unsupported type=%s — skipping", name, kind)
                 continue
             out[name] = spec
+        for name in self.allow:
+            if name not in servers:
+                log.warning("allowlisted upstream '%s' not found in config/mcp.json", name)
         return out
 
     async def start(self) -> None:
