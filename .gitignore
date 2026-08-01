@@ -8,3 +8,4 @@ app.json
 back/config/gateway.json.e2e
 back/config/link_tokens.json
 *.tsbuildinfo
+.claude/worktrees/
