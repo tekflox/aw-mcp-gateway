@@ -20,7 +20,7 @@
     },
     "volumes": [
       {
-        "source": "back/config",
+        "source": "$AW_APP_DATA",
         "target": "/app/config",
         "mode": "rw"
       },
@@ -38,7 +38,8 @@
   },
   "permissions": [
     "containers:manage",
-    "mcp:register-gateway"
+    "mcp:register-gateway",
+    "fs:workspace-data"
   ],
   "contributes": {},
   "config_schema": {
