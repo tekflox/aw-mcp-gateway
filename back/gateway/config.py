@@ -225,9 +225,19 @@ def register_self_in_host_mcp_json(port: int, bearer_token: str) -> None:
     """
     if not HOST_MCP_JSON:
         return
+    # 127.0.0.1 would resolve to THIS container's own loopback, not to
+    # whatever process reads the host .mcp.json (a sibling container on the
+    # workspace's shared podman network, in the aw-workspace deployment this
+    # was built for). AW_APP_SELF_HOST is aw-workspace's own name for this
+    # container (`aw-app-<slug>`, injected by ContainerSupervisor.start()) —
+    # exactly what siblings already resolve it by via aardvark-dns. Falls
+    # back to 127.0.0.1 for a bare/standalone run with no such env (dev,
+    # tests, non-aw-workspace deployments) where that fallback is at least
+    # sometimes correct (e.g. host networking).
+    host = os.environ.get("AW_APP_SELF_HOST", "127.0.0.1")
     entry = {
         "type": "http",
-        "url": f"http://127.0.0.1:{port}/mcp",
+        "url": f"http://{host}:{port}/mcp",
         "headers": {"Authorization": f"Bearer {bearer_token}"},
     }
     data = _read_json(HOST_MCP_JSON, _empty_mcp())

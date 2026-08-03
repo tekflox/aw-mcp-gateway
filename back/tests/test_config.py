@@ -125,6 +125,7 @@ def test_register_self_writes_entry_preserving_other_servers(tmp_path, monkeypat
     host_json = tmp_path / ".mcp.json"
     _write_json(host_json, {"mcpServers": {"other-app": {"type": "stdio", "command": "x"}}})
     monkeypatch.setattr(config, "HOST_MCP_JSON", str(host_json))
+    monkeypatch.delenv("AW_APP_SELF_HOST", raising=False)
 
     config.register_self_in_host_mcp_json(9200, "tok-123")
 
@@ -137,9 +138,25 @@ def test_register_self_writes_entry_preserving_other_servers(tmp_path, monkeypat
     }
 
 
+def test_register_self_uses_aw_app_self_host_when_set(tmp_path, monkeypatch):
+    """127.0.0.1 only resolves inside THIS container's own netns — on
+    aw-workspace, AW_APP_SELF_HOST (injected by ContainerSupervisor.start())
+    is the name siblings actually reach this container by, and must be
+    preferred over the loopback fallback."""
+    host_json = tmp_path / ".mcp.json"
+    monkeypatch.setattr(config, "HOST_MCP_JSON", str(host_json))
+    monkeypatch.setenv("AW_APP_SELF_HOST", "aw-app-mcp-gateway")
+
+    config.register_self_in_host_mcp_json(9200, "tok-123")
+
+    data = json.loads(host_json.read_text())
+    assert data["mcpServers"]["aw-gateway"]["url"] == "http://aw-app-mcp-gateway:9200/mcp"
+
+
 def test_register_self_creates_missing_host_mcp_json(tmp_path, monkeypatch):
     host_json = tmp_path / "nested" / ".mcp.json"
     monkeypatch.setattr(config, "HOST_MCP_JSON", str(host_json))
+    monkeypatch.delenv("AW_APP_SELF_HOST", raising=False)
 
     config.register_self_in_host_mcp_json(9200, "tok")
 
