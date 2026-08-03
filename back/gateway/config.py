@@ -63,6 +63,25 @@ def _write_json(path: str, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def _write_json_in_place(path: str, data: dict) -> None:
+    """Like ``_write_json`` but truncates and rewrites ``path`` directly instead
+    of writing a ``.tmp`` sibling and ``os.replace``-ing it into place.
+
+    Required for ``HOST_MCP_JSON``: aw-workspace bind-mounts that path into this
+    container as a single file, and ``os.replace(tmp, path)`` fails with
+    ``EBUSY: Device or resource busy`` when ``path`` is the target of an active
+    bind mount — the kernel won't let a container swap the inode its own mount
+    is pinned to. A plain truncate-and-write has no such restriction (same
+    inode stays mounted, only its contents change) and is safe here since this
+    file has a single writer (this function) with no concurrent readers
+    expected mid-write.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
 def _mcp_servers(data: dict) -> dict:
     servers = data.get("mcpServers") if isinstance(data, dict) else {}
     return servers if isinstance(servers, dict) else {}
@@ -198,17 +217,28 @@ def workspace_name() -> str:
 def token() -> str:
     """Bearer token — sourced from ``config/gateway.json``'s ``token`` field.
 
-    Mints an ephemeral one (and warns) if unset, rather than silently running
-    unauthenticated — mirrors the in-repo mcp-gateway's behavior.
+    Mints one and persists it back to ``config/gateway.json`` on first use, so
+    the same token survives future process restarts/container recreations —
+    without this, every restart minted a fresh in-memory-only token, which
+    silently broke every client's saved ``.mcp.json`` (401s) since the token
+    they had on disk no longer matched. Falls back to a process-only ephemeral
+    token (and warns) only if the persist write itself fails.
     """
-    tok = (load_gateway_config().get("token") or "").strip()
+    cfg = load_gateway_config()
+    tok = (cfg.get("token") or "").strip()
     if tok:
         return tok
     tok = secrets.token_urlsafe(32)
     import logging
-    logging.getLogger("aw-mcp-gateway").warning(
-        "no 'token' in config/gateway.json — using an EPHEMERAL token "
-        "for this process only (set one in config/gateway.json): %s", tok)
+    log = logging.getLogger("aw-mcp-gateway")
+    cfg["token"] = tok
+    try:
+        _write_json(GATEWAY_JSON, cfg)
+        log.info("minted and persisted a new bearer token to %s", GATEWAY_JSON)
+    except OSError as e:
+        log.warning(
+            "no 'token' in config/gateway.json and could not persist a new one "
+            "(%s) — using an EPHEMERAL token for this process only: %s", e, tok)
     return tok
 
 
@@ -249,7 +279,7 @@ def register_self_in_host_mcp_json(port: int, bearer_token: str) -> None:
     import logging
     log = logging.getLogger("aw-mcp-gateway")
     try:
-        _write_json(HOST_MCP_JSON, data)
+        _write_json_in_place(HOST_MCP_JSON, data)
         log.info("registered self as 'aw-gateway' in host %s", HOST_MCP_JSON)
     except OSError as e:
         log.warning("could not write host mcp.json at %s: %s", HOST_MCP_JSON, e)

@@ -196,6 +196,68 @@ def test_workspace_name_empty_when_neither_set(tmp_path, monkeypatch):
     assert config.workspace_name() == ""
 
 
+def test_token_returns_configured_value(tmp_path, monkeypatch):
+    gw_json = tmp_path / "gateway.json"
+    _write_json(gw_json, {"token": "configured-token"})
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
+    assert config.token() == "configured-token"
+
+
+def test_token_mints_and_persists_when_unset(tmp_path, monkeypatch):
+    gw_json = tmp_path / "missing-gateway.json"
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
+
+    minted = config.token()
+
+    assert minted
+    assert json.loads(gw_json.read_text())["token"] == minted
+
+
+def test_token_survives_restart_by_rereading_persisted_value(tmp_path, monkeypatch):
+    """The bug this guards: token() used to mint a brand-new ephemeral token
+    every process start because nothing was ever persisted, so a client's
+    saved .mcp.json bearer went stale on the very next restart."""
+    gw_json = tmp_path / "gateway.json"
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
+
+    first = config.token()
+    second = config.token()
+
+    assert first == second
+
+
+def test_token_preserves_other_gateway_json_fields_when_persisting(tmp_path, monkeypatch):
+    gw_json = tmp_path / "gateway.json"
+    _write_json(gw_json, {"workspace_name": "aw"})
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
+
+    minted = config.token()
+
+    data = json.loads(gw_json.read_text())
+    assert data["token"] == minted
+    assert data["workspace_name"] == "aw"
+
+
+def test_register_self_writes_in_place_over_single_file_bind_mount(tmp_path, monkeypatch):
+    """Reproduces the real failure: os.replace() over a path that is itself an
+    active bind-mount target raises EBUSY (can't atomically swap the mounted
+    inode from inside the container). register_self_in_host_mcp_json must not
+    call the tmp-then-rename path for HOST_MCP_JSON."""
+    host_json = tmp_path / ".mcp.json"
+    _write_json(host_json, {"mcpServers": {}})
+    monkeypatch.setattr(config, "HOST_MCP_JSON", str(host_json))
+
+    def _boom(path, data):
+        raise OSError(16, "Device or resource busy")
+
+    monkeypatch.setattr(config, "_write_json", _boom)
+
+    config.register_self_in_host_mcp_json(9200, "tok-123")
+
+    data = json.loads(host_json.read_text())
+    assert data["mcpServers"]["aw-gateway"]["headers"]["Authorization"] == "Bearer tok-123"
+
+
 async def test_local_upstream_tool_names_are_namespaced_by_workspace(tmp_path, monkeypatch):
     custom_path = tmp_path / "mcp.custom.json"
     _write_json(custom_path, {"mcpServers": {
