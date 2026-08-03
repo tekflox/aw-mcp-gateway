@@ -310,7 +310,7 @@ class Gateway:
 
 
 def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] | None = None,
-              token_store: TokenStore | None = None) -> FastAPI:
+              token_store: TokenStore | None = None, port: int = 9200) -> FastAPI:
     from contextlib import asynccontextmanager
 
     named_configs = named_configs or {}
@@ -319,6 +319,7 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         await gateway.start()
+        config.register_self_in_host_mcp_json(port, token)
         yield
 
     app = FastAPI(title="AW MCP Gateway (standalone)", lifespan=lifespan)
@@ -486,7 +487,7 @@ def main() -> None:
         for name, spec in (gw_cfg.get("configs") or {}).items()
     }
     gateway = Gateway(allow)
-    app = build_app(gateway, tok, named_configs)
+    app = build_app(gateway, tok, named_configs, port=args.port)
 
     log.info("AW MCP Gateway (standalone) on http://%s:%d/mcp (+ ws /link)", args.host, args.port)
     log.info("local upstream allowlist: %s", ", ".join(allow) or "—")

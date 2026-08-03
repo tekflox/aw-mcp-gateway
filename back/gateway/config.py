@@ -31,6 +31,13 @@ GATEWAY_JSON = os.environ.get("AW_GATEWAY_JSON", os.path.join(BASE_DIR, "config"
 LINK_TOKENS_JSON = os.environ.get("AW_LINK_TOKENS_JSON", os.path.join(BASE_DIR, "config", "link_tokens.json"))
 APP_SCAN_ROOTS = os.environ.get("AW_APP_SCAN_ROOTS", "/workspace/apps")
 
+# Path (inside the container) to the aw-workspace HOST's root .mcp.json — only
+# present when installed as an aw-workspace app with the $AW_MCP_JSON volume
+# (see aw-app.json, permission 'mcp:register-gateway'). Empty when running
+# standalone (bare `python3 -m gateway.server`, tests, or outside aw-workspace
+# entirely) — register_self_in_host_mcp_json() no-ops in that case.
+HOST_MCP_JSON = os.environ.get("AW_HOST_MCP_JSON", "")
+
 DEFAULT_MAX_FEDERATION_DEPTH = 6
 
 
@@ -203,3 +210,36 @@ def token() -> str:
         "no 'token' in config/gateway.json — using an EPHEMERAL token "
         "for this process only (set one in config/gateway.json): %s", tok)
     return tok
+
+
+def register_self_in_host_mcp_json(port: int, bearer_token: str) -> None:
+    """Best-effort: add/update this gateway's own entry in the aw-workspace
+    host's root ``.mcp.json`` so an MCP-JSON-reading client (Claude Code, any
+    other agent CLI) picks up the gateway automatically right after install —
+    no manual edit needed. Runs once at boot (see server.py's lifespan).
+
+    No-op when ``HOST_MCP_JSON`` is unset — a bare ``python3 -m gateway.server``
+    dev run, or the test suite, has no host mount and nothing to write.
+    Idempotent: skips the write entirely if the entry already matches, so
+    restarts don't churn the file or spam the log.
+    """
+    if not HOST_MCP_JSON:
+        return
+    entry = {
+        "type": "http",
+        "url": f"http://127.0.0.1:{port}/mcp",
+        "headers": {"Authorization": f"Bearer {bearer_token}"},
+    }
+    data = _read_json(HOST_MCP_JSON, _empty_mcp())
+    servers = _mcp_servers(data)
+    if servers.get("aw-gateway") == entry:
+        return
+    servers["aw-gateway"] = entry
+    data["mcpServers"] = servers
+    import logging
+    log = logging.getLogger("aw-mcp-gateway")
+    try:
+        _write_json(HOST_MCP_JSON, data)
+        log.info("registered self as 'aw-gateway' in host %s", HOST_MCP_JSON)
+    except OSError as e:
+        log.warning("could not write host mcp.json at %s: %s", HOST_MCP_JSON, e)

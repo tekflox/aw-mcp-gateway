@@ -115,6 +115,50 @@ def test_admin_config_accepts_workspace_identity_header(tmp_path, monkeypatch):
     assert res.json()["final"] == {"mcpServers": {}}
 
 
+def test_register_self_noop_without_host_mcp_json(monkeypatch):
+    monkeypatch.setattr(config, "HOST_MCP_JSON", "")
+    # Would raise/crash on a bad path if it tried to read or write anything.
+    config.register_self_in_host_mcp_json(9200, "tok")
+
+
+def test_register_self_writes_entry_preserving_other_servers(tmp_path, monkeypatch):
+    host_json = tmp_path / ".mcp.json"
+    _write_json(host_json, {"mcpServers": {"other-app": {"type": "stdio", "command": "x"}}})
+    monkeypatch.setattr(config, "HOST_MCP_JSON", str(host_json))
+
+    config.register_self_in_host_mcp_json(9200, "tok-123")
+
+    data = json.loads(host_json.read_text())
+    assert data["mcpServers"]["other-app"] == {"type": "stdio", "command": "x"}
+    assert data["mcpServers"]["aw-gateway"] == {
+        "type": "http",
+        "url": "http://127.0.0.1:9200/mcp",
+        "headers": {"Authorization": "Bearer tok-123"},
+    }
+
+
+def test_register_self_creates_missing_host_mcp_json(tmp_path, monkeypatch):
+    host_json = tmp_path / "nested" / ".mcp.json"
+    monkeypatch.setattr(config, "HOST_MCP_JSON", str(host_json))
+
+    config.register_self_in_host_mcp_json(9200, "tok")
+
+    assert json.loads(host_json.read_text())["mcpServers"]["aw-gateway"]["url"] == \
+        "http://127.0.0.1:9200/mcp"
+
+
+def test_register_self_is_idempotent(tmp_path, monkeypatch):
+    host_json = tmp_path / ".mcp.json"
+    _write_json(host_json, {"mcpServers": {}})
+    monkeypatch.setattr(config, "HOST_MCP_JSON", str(host_json))
+
+    config.register_self_in_host_mcp_json(9200, "tok")
+    written_at = host_json.stat().st_mtime_ns
+    config.register_self_in_host_mcp_json(9200, "tok")
+
+    assert host_json.stat().st_mtime_ns == written_at  # no rewrite — same entry
+
+
 def test_workspace_name_prefers_gateway_json_over_env(tmp_path, monkeypatch):
     gw_json = tmp_path / "gateway.json"
     _write_json(gw_json, {"workspace_name": "configured-ws"})
