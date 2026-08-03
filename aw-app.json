@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "mcp-gateway",
   "name": "MCP Gateway",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Share your workspace's tools with any AI agent, and reach tools from other workspaces in return. Install MCP Gateway and every tool your other apps expose becomes instantly callable \u2014 no per-app setup. Connect it to another gateway to pull in that workspace's tools too, with per-connection access tokens you control.",
   "tier": "container",
   "publisher": "TekFlox",
