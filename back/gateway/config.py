@@ -29,7 +29,7 @@ MCP_CUSTOM_JSON = os.environ.get(
     "AW_MCP_CUSTOM_JSON", os.path.join(BASE_DIR, "config", "mcp.custom.json"))
 GATEWAY_JSON = os.environ.get("AW_GATEWAY_JSON", os.path.join(BASE_DIR, "config", "gateway.json"))
 LINK_TOKENS_JSON = os.environ.get("AW_LINK_TOKENS_JSON", os.path.join(BASE_DIR, "config", "link_tokens.json"))
-APP_SCAN_ROOTS = os.environ.get("AW_APP_SCAN_ROOTS", "/workspace/apps")
+APP_SCAN_ROOTS = os.environ.get("AW_APP_SCAN_ROOTS", "/opt/aw-workspace/apps")
 
 # Path (inside the container) to the aw-workspace HOST's root .mcp.json — only
 # present when installed as an aw-workspace app with the $AW_MCP_JSON volume

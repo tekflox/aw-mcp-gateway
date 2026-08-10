@@ -15,7 +15,7 @@
     "image": "ghcr.io/tekflox/aw-mcp-gateway:latest",
     "port": 9200,
     "env": {
-      "AW_APP_SCAN_ROOTS": "/workspace/apps",
+      "AW_APP_SCAN_ROOTS": "/opt/aw-workspace/apps",
       "AW_HOST_MCP_JSON": "/host-mcp.json"
     },
     "volumes": [
@@ -26,7 +26,7 @@
       },
       {
         "source": "$AW_APPS_ROOT",
-        "target": "/workspace/apps",
+        "target": "/opt/aw-workspace/apps",
         "mode": "ro"
       },
       {
