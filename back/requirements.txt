@@ -2,3 +2,15 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 httpx>=0.27
 websockets>=12.0
+# For local stdio upstreams that are themselves built on the official MCP
+# Python SDK (today: aw-app-devctl's devctl-browser, `from mcp.server.fastmcp
+# import FastMCP`) — those apps declare this in their own aw-app.json
+# runtime.pip_requires, but that field isn't actually enforced by the
+# platform (installs nothing), and a Tier-1 app has no way to install
+# anything into this (separate, Tier-2) container anyway. Bundled here for
+# the same reason nodejs/npm already are (Dockerfile) — upstreams spawned
+# via bare "python3"/"npx" need their runtime available in THIS image.
+# Pinned below 2.0: that release moved/renamed FastMCP (mcp==2.0.0 has no
+# mcp.server.fastmcp submodule at all) — devctl-browser's code targets the
+# 1.x API shape, matching its own aw-app.json's declared "mcp>=1.2".
+mcp>=1.2,<2.0
