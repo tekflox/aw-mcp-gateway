@@ -7,5 +7,11 @@ dist/
 app.json
 back/config/gateway.json.e2e
 back/config/link_tokens.json
+# Generated at boot, not authored: config.py rebuilds it from every installed
+# app's own mcp.json plus mcp.custom.json. Tracking it meant committing whatever
+# the framework had just written in — which on 2026-08-15 was the workspace's
+# live X-Api-Key and a real AGENTS_PLATFORM_TOKEN, in a public repo. The
+# authored layer is mcp.custom.json, which is tracked and holds no credentials.
+back/config/mcp.json
 *.tsbuildinfo
 .claude/worktrees/
