@@ -120,6 +120,16 @@ def scan_app_mcp_servers(scan_roots: list[Path] | None = None) -> tuple[dict, di
             if resolved in (final_path, custom_path) or not mcp_path.is_file():
                 continue
             for name, spec in _mcp_servers(_read_json(str(mcp_path), _empty_mcp())).items():
+                spec = dict(spec)
+                # Opt-in: a stdio server whose command/args reference files by a
+                # path relative to its own app root sets ``cwd_app_dir: true`` so
+                # the child spawns with cwd = that app's package dir (instead of
+                # the gateway's own BASE_DIR default in Upstream). Purely
+                # additive — entries that don't set the flag are copied verbatim,
+                # so every existing upstream keeps its exact prior behavior. An
+                # explicit ``cwd`` already in the spec always wins.
+                if spec.pop("cwd_app_dir", False) and "cwd" not in spec:
+                    spec["cwd"] = str(app_dir)
                 servers[name] = spec
                 sources[name] = {
                     "source": "scanned",

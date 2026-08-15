@@ -42,6 +42,55 @@ def test_effective_mcp_config_scans_apps_and_custom_overrides(tmp_path, monkeypa
     assert json.loads(final_path.read_text()) == payload["final"]
 
 
+def test_cwd_app_dir_flag_resolves_cwd_to_app_dir(tmp_path, monkeypatch):
+    apps = tmp_path / "apps"
+    final_path = tmp_path / "gateway" / "mcp.json"
+    custom_path = tmp_path / "gateway" / "mcp.custom.json"
+    # One server opts in, one does not — the opt-out server must be byte-for-byte
+    # unchanged (no cwd injected) so existing upstreams keep their prior behavior.
+    _write_json(apps / "ux-proto" / "mcp.json", {
+        "mcpServers": {
+            "aw-ux-proto": {
+                "type": "stdio", "command": "python3",
+                "args": ["mcp/aw_ux_proto.py"], "cwd_app_dir": True,
+            },
+            "no-flag": {"type": "stdio", "command": "python3", "args": ["x.py"]},
+        }
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "MCP_JSON", str(final_path))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(custom_path))
+
+    servers, _ = config.scan_app_mcp_servers()
+
+    # Flagged server: cwd points at its own app dir, and the flag itself is
+    # stripped from the emitted spec (Upstream never sees an unknown key).
+    assert servers["aw-ux-proto"]["cwd"] == str(apps / "ux-proto")
+    assert "cwd_app_dir" not in servers["aw-ux-proto"]
+    # Un-flagged server: no cwd key at all → Upstream falls back to BASE_DIR.
+    assert "cwd" not in servers["no-flag"]
+
+
+def test_cwd_app_dir_flag_does_not_override_explicit_cwd(tmp_path, monkeypatch):
+    apps = tmp_path / "apps"
+    _write_json(apps / "some-app" / "mcp.json", {
+        "mcpServers": {
+            "srv": {
+                "type": "stdio", "command": "python3", "args": ["s.py"],
+                "cwd": "/explicit/path", "cwd_app_dir": True,
+            },
+        }
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "MCP_JSON", str(apps / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(apps / "mcp.custom.json"))
+
+    servers, _ = config.scan_app_mcp_servers()
+
+    assert servers["srv"]["cwd"] == "/explicit/path"
+    assert "cwd_app_dir" not in servers["srv"]
+
+
 def test_load_specs_auto_trusts_scanned_servers_without_an_allowlist_entry(tmp_path, monkeypatch):
     """Installing an app is enough on its own — Gateway._load_specs() must
     start its contributed (scanned) server even with an empty self.allow.
