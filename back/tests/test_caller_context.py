@@ -82,3 +82,11 @@ def test_a_configured_header_still_wins_over_a_forwarded_one():
     caller_context.capture({"x-aw-caller-session-id": "from-the-caller"})
 
     assert up._client_headers()["x-aw-caller-session-id"] == "configured"
+
+
+def test_the_agent_identity_is_forwarded_too():
+    """Unlike the session, an agent id is the same next week — which is what a
+    per-secret allowlist can name."""
+    caller_context.capture({"x-aw-caller-agent": "agent:nightly-backup"})
+
+    assert caller_context.current() == {"x-aw-caller-agent": "agent:nightly-backup"}

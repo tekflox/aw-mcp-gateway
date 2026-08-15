@@ -25,7 +25,7 @@ from contextvars import ContextVar
 
 #: Inbound headers forwarded to upstreams, lowercase. Keep this short and
 #: boring — every addition is something a caller can now assert about itself.
-FORWARDED = ("x-aw-caller-session-id", "x-aw-caller-run-id")
+FORWARDED = ("x-aw-caller-session-id", "x-aw-caller-run-id", "x-aw-caller-agent")
 
 _caller_headers: ContextVar[dict] = ContextVar("aw_caller_headers", default={})
 
