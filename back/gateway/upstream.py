@@ -23,6 +23,8 @@ import os
 
 import httpx
 
+from . import caller_context
+
 from .config import BASE_DIR
 
 log = logging.getLogger("aw-mcp-gateway")
@@ -212,6 +214,9 @@ class HttpUpstream:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
+            # Who is on the far side of this gateway. Without it an upstream
+            # sees every agent as the same caller — see caller_context.
+            **caller_context.current(),
             **self._extra_headers,
         }
         if self._session_id:

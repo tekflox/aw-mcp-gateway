@@ -13,6 +13,8 @@ import logging
 import os
 
 from fastapi import FastAPI, Header, Request, WebSocket
+
+from . import caller_context
 from fastapi.responses import JSONResponse, Response
 
 from . import config
@@ -337,6 +339,8 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
 
     async def _dispatch(handler, request: Request, authorization: str | None) -> Response:
         _check_auth(authorization)
+        # Before any upstream call in this request's task — see caller_context.
+        caller_context.capture(request.headers)
         body = await request.json()
         messages = body if isinstance(body, list) else [body]
         responses = []
