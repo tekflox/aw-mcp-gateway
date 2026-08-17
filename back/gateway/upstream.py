@@ -152,6 +152,19 @@ class Upstream:
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
 
+        # Mirror HttpUpstream._client_headers(): this stdio child has no HTTP
+        # request of its own to carry caller identity on, so it goes into the
+        # JSON-RPC arguments instead — the convention agents-platform's own
+        # tools (mark_as_planned/mark_flow_done/ask_human/register_callback,
+        # via _caller_run_id()) already expect. Without this, every one of
+        # those tools 400s "Could not identify this run" for every caller,
+        # because this Upstream is one persistent child shared across all of
+        # them (unlike a per-run docker CLI agent, os.environ.AW_RUN_ID here
+        # is fixed at spawn and not caller-specific).
+        caller_run_id = caller_context.current().get("x-aw-caller-run-id")
+        if caller_run_id and "_gateway_caller_run_id" not in arguments:
+            arguments = {**arguments, "_gateway_caller_run_id": caller_run_id}
+
         async with self._lifecycle_lock:
             await self._ensure_alive()
             self._pending[req_id] = fut
