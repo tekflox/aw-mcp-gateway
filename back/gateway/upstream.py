@@ -259,7 +259,13 @@ class HttpUpstream:
         return resp.json()
 
     async def start(self) -> None:
-        self._client = httpx.AsyncClient(timeout=30.0)
+        # follow_redirects: an upstream that 301s the handshake (e.g. an
+        # Apache/WordPress vhost forcing canonical https) otherwise blows up
+        # in _post()'s raise_for_status() — httpx treats an unfollowed
+        # redirect as an HTTPStatusError, not a success, so start() would
+        # raise and the upstream would be dropped with 0 tools instead of
+        # transparently following the hop like a browser would.
+        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
         init = await self._post({
             "jsonrpc": "2.0", "id": "init", "method": "initialize",
             "params": {"protocolVersion": DEFAULT_PROTOCOL,
@@ -347,7 +353,10 @@ class GatewayUpstream(HttpUpstream):
         self.remote_chain: list[str] = []
 
     async def start(self) -> None:
-        self._client = httpx.AsyncClient(timeout=30.0)
+        # Same reasoning as HttpUpstream.start(): don't let an unfollowed
+        # redirect on /healthz or the handshake sink an otherwise-reachable
+        # federated gateway.
+        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
         resp = await self._client.get(_healthz_url(self.url), headers=self._extra_headers)
         resp.raise_for_status()
         health = resp.json()

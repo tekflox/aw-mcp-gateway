@@ -14,3 +14,12 @@ websockets>=12.0
 # mcp.server.fastmcp submodule at all) — devctl-browser's code targets the
 # 1.x API shape, matching its own aw-app.json's declared "mcp>=1.2".
 mcp>=1.2,<2.0
+# Same reasoning, same fix, for aw-app-travel's stdio upstream (`python3 -m
+# travel_app.mcp_server`): its aw-app.json declares runtime.pip_requires =
+# ["flights"] (PyPI dist name for the `fli` import), which — like every
+# Tier-1 app's pip_requires — installs nothing into this Tier-2 container.
+# Without it the child crashes on `from fli.core import ...` before ever
+# answering the handshake; the gateway sees the pipe die mid-negotiation and
+# logs a misleading "WriteUnixTransport closed" RuntimeError instead of the
+# real ModuleNotFoundError (stderr is DEVNULL'd in Upstream._spawn()).
+flights>=0.9,<0.10
