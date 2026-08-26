@@ -184,6 +184,123 @@ def load_gateway_config() -> dict:
         return {}
 
 
+def save_gateway_config(data: dict) -> dict:
+    """Persist the whole ``config/gateway.json``. Callers read-modify-write so
+    a partial save never drops the minted ``token``/``gateway_id``."""
+    _write_json(GATEWAY_JSON, data)
+    return data
+
+
+#: A named config's key doubles as a URL path segment (``/mcp/<name>``), so it
+#: is restricted to what is unambiguous there — no slashes, dots or spaces.
+_CONFIG_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+
+#: Keys a named config may carry. Anything else is dropped on save rather than
+#: silently persisted, so a typo shows up immediately instead of reading as a
+#: policy that is quietly doing nothing.
+CONFIG_LIST_KEYS = (
+    "upstreams",
+    "run_agents_allow", "run_workflows_allow",
+    "run_agents_approval", "run_workflows_approval",
+    "run_agents_always_allow", "run_workflows_always_allow",
+)
+CONFIG_SCALAR_KEYS = ("kb_index", "presentation_namespace")
+
+
+def valid_config_name(name: str) -> bool:
+    return bool(name) and set(name) <= _CONFIG_NAME_CHARS
+
+
+def normalize_config_spec(spec: dict) -> dict:
+    """Coerce one named-config object to its canonical shape: known keys only,
+    lists of non-empty strings, empty lists/values dropped entirely (an absent
+    key is what "unrestricted" means everywhere downstream, so persisting an
+    empty list would only be noise)."""
+    out: dict = {}
+    for key in CONFIG_LIST_KEYS:
+        raw = spec.get(key)
+        if isinstance(raw, str):
+            raw = [raw]
+        values = [str(v).strip() for v in (raw or []) if str(v).strip()]
+        if values:
+            out[key] = values
+    for key in CONFIG_SCALAR_KEYS:
+        raw = spec.get(key)
+        if isinstance(raw, list):
+            values = [str(v).strip() for v in raw if str(v).strip()]
+            if values:
+                out[key] = values[0] if len(values) == 1 else values
+        elif isinstance(raw, str) and raw.strip():
+            out[key] = raw.strip()
+    # ``upstreams`` is the one key that must always be present — a config with
+    # no upstreams is a valid (empty) profile, not a malformed one.
+    out.setdefault("upstreams", [])
+    return out
+
+
+def named_configs() -> dict:
+    """The named configs from ``config/gateway.json``, normalized."""
+    raw = load_gateway_config().get("configs")
+    if not isinstance(raw, dict):
+        return {}
+    return {name: normalize_config_spec(spec if isinstance(spec, dict) else {})
+            for name, spec in raw.items() if valid_config_name(str(name))}
+
+
+def save_named_configs(configs: dict) -> dict:
+    """Read-modify-write ``configs`` into ``config/gateway.json``.
+
+    Raises ``ValueError`` on an unusable name so the caller can answer 400
+    rather than persist a config that could never be reached at ``/mcp/<name>``.
+    """
+    if not isinstance(configs, dict):
+        raise ValueError("configs must be an object")
+    clean: dict = {}
+    for name, spec in configs.items():
+        name = str(name).strip()
+        if not valid_config_name(name):
+            raise ValueError(
+                f"invalid config name {name!r} — letters, digits, '-' and '_' only")
+        clean[name] = normalize_config_spec(spec if isinstance(spec, dict) else {})
+    cfg = load_gateway_config()
+    cfg["configs"] = clean
+    save_gateway_config(cfg)
+    return clean
+
+
+def policy_upstream_overrides() -> dict:
+    """``config/gateway.json``'s ``policy_upstreams`` block — which upstream
+    names count as the agents-platform / knowledge-base / presentation roles
+    for per-config policy. See ``config_gateway.policy_upstreams``."""
+    raw = load_gateway_config().get("policy_upstreams")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def agents_base(servers: dict | None = None) -> str:
+    """Base URL of the Agents Platform the approval gate should call.
+
+    Derived, in order, from: an explicit ``agents_base`` in
+    ``config/gateway.json``; the ``env.AGENTS_BASE`` of whichever configured
+    upstream fills the ``agents_platform`` role (i.e. whatever that upstream
+    itself already talks to — nothing extra to configure, and it cannot drift
+    out of sync); then ``$AGENTS_BASE``. Empty if none of those exist, which
+    makes the approval gate fail closed.
+    """
+    cfg = load_gateway_config()
+    explicit = (cfg.get("agents_base") or "").strip()
+    if explicit:
+        return explicit
+    from .config_gateway import policy_upstreams  # local: avoid an import cycle
+    names = policy_upstreams(policy_upstream_overrides()).get("agents_platform", set())
+    servers = servers if servers is not None else _mcp_servers(_read_json(MCP_JSON, _empty_mcp()))
+    for name in names:
+        env = (servers.get(name) or {}).get("env") or {}
+        base = str(env.get("AGENTS_BASE") or "").strip()
+        if base:
+            return base
+    return (os.environ.get("AGENTS_BASE") or "").strip()
+
+
 def link_tokens_path() -> str:
     return LINK_TOKENS_JSON
 

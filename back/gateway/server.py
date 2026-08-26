@@ -18,7 +18,7 @@ from . import caller_context
 from fastapi.responses import JSONResponse, Response
 
 from . import config
-from .config_gateway import ConfigGateway
+from .config_gateway import ConfigGateway, policy_upstreams
 from .remote_upstream import RemoteUpstream, link_endpoint
 from .token_store import FileTokenStore, TokenStore
 from .upstream import (
@@ -311,11 +311,51 @@ class Gateway:
             "code": -32601, "message": f"Unknown method: {method}"}}
 
 
-def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] | None = None,
+class NamedConfigs:
+    """The live set of named configs (scoped ``/mcp/<name>`` profiles).
+
+    Holds the specs in memory so ``PUT /admin/configs`` takes effect on the
+    very next request — the endpoint is ONE dynamic route that looks a profile
+    up by name at call time, not one FastAPI route registered per config at
+    boot. That is the difference between "add a config" and "add a config, then
+    remember to restart the gateway"; the monolith this was ported from needed
+    the restart, and a profile that 404s until someone notices is exactly the
+    kind of silent degradation this workspace already has too much of.
+    """
+
+    def __init__(self, specs: dict | None = None, agents_base: str = "",
+                 upstream_roles: dict | None = None):
+        self.specs: dict[str, dict] = dict(specs or {})
+        self.agents_base = agents_base
+        self.upstream_roles = upstream_roles or policy_upstreams()
+
+    def names(self) -> list[str]:
+        return sorted(self.specs)
+
+    def replace(self, specs: dict) -> None:
+        self.specs = dict(specs or {})
+
+    def gateway_for(self, gateway: Gateway, name: str) -> ConfigGateway | None:
+        spec = self.specs.get(name)
+        if spec is None:
+            return None
+        return ConfigGateway(gateway, spec, name=name,
+                             agents_base=self.agents_base,
+                             upstream_roles=self.upstream_roles)
+
+
+def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
               token_store: TokenStore | None = None, port: int = 9200) -> FastAPI:
     from contextlib import asynccontextmanager
 
-    named_configs = named_configs or {}
+    # Accepts the historical ``{name: [upstreams]}`` shape as well as the full
+    # ``{name: {...spec}}`` one — ConfigGateway normalises either.
+    configs = NamedConfigs(
+        {name: (spec if isinstance(spec, dict) else {"upstreams": list(spec or [])})
+         for name, spec in (named_configs or {}).items()},
+        agents_base=config.agents_base(),
+        upstream_roles=policy_upstreams(config.policy_upstream_overrides()),
+    )
     token_store = token_store or FileTokenStore(config.link_tokens_path())
 
     @asynccontextmanager
@@ -360,7 +400,7 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
                 "local_upstreams": list(gateway.upstreams),
                 "remote_upstreams": list(gateway.remotes),
                 "tools": len(gateway.agg_tools),
-                "configs": list(named_configs.keys()),
+                "configs": configs.names(),
                 "gateway_id": gateway.gateway_id,
                 # Which workspace this gateway belongs to. Unauthenticated on
                 # purpose, alongside gateway_id: the case a caller most needs
@@ -455,17 +495,84 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
             return JSONResponse({"error": "unknown token id"}, status_code=404)
         return {"ok": True}
 
-    for cfg_name, cfg_upstreams in named_configs.items():
-        cgw = ConfigGateway(gateway, cfg_upstreams, name=cfg_name)
+    def _upstream_candidates() -> list[dict]:
+        """Every upstream a named config could be pointed at, with whether it
+        is actually running right now. The admin UI needs both: a config may
+        legitimately name an upstream that is momentarily down, and hiding it
+        would silently drop it from the config on the next save."""
+        specs = config.load_mcp_servers()
+        names = set(specs) | set(gateway.upstreams) | set(gateway.remotes)
+        out = []
+        for name in sorted(names):
+            spec = specs.get(name) or {}
+            out.append({
+                "name": name,
+                "type": spec.get("type", "stdio") if spec else "remote",
+                "enabled": spec.get("enabled") is not False,
+                "running": name in gateway.upstreams or name in gateway.remotes,
+                "tools": sum(1 for r in gateway.routes.values() if r[0] == name),
+            })
+        return out
 
-        def _make_handler(handler=cgw):
-            async def _h(request: Request, authorization: str | None = Header(default=None)):
-                return await _dispatch(handler, request, authorization)
-            return _h
+    def _configs_payload() -> dict:
+        return {
+            "configs": configs.specs,
+            "candidates": _upstream_candidates(),
+            "policy_upstreams": {k: sorted(v) for k, v in configs.upstream_roles.items()},
+            "agents_base": configs.agents_base,
+            "endpoint_template": f"http://127.0.0.1:{port}/mcp/{{name}}",
+        }
 
-        app.post(f"/mcp/{cfg_name}")(_make_handler())
-        app.get(f"/mcp/{cfg_name}")(lambda: Response(status_code=405))
-        log.info("config endpoint registered: /mcp/%s (%s)", cfg_name, ", ".join(cfg_upstreams) or "—")
+    @app.get("/admin/configs")
+    async def get_named_configs(
+        authorization: str | None = Header(default=None),
+        workspace_identity: str | None = Header(default=None, alias="X-AW-Identity-Sub"),
+    ):
+        _check_admin_auth(authorization, workspace_identity)
+        return _configs_payload()
+
+    @app.put("/admin/configs")
+    async def put_named_configs(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        workspace_identity: str | None = Header(default=None, alias="X-AW-Identity-Sub"),
+    ):
+        """Replace the whole named-config set and apply it immediately.
+
+        Whole-set (not per-config) because that is what the editor holds and
+        it makes deletion expressible without a second verb."""
+        _check_admin_auth(authorization, workspace_identity)
+        body = await request.json()
+        incoming = body.get("configs") if isinstance(body, dict) else None
+        if incoming is None:
+            incoming = body
+        try:
+            saved = config.save_named_configs(incoming)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        configs.replace(saved)
+        # Re-derive here too: a config can start naming agents-platform for the
+        # first time, and the approval gate needs a base URL for it right away.
+        configs.agents_base = config.agents_base()
+        log.info("named configs updated: %s", ", ".join(configs.names()) or "—")
+        return _configs_payload()
+
+    @app.post("/mcp/{cfg_name}")
+    async def mcp_config_post(cfg_name: str, request: Request,
+                              authorization: str | None = Header(default=None)):
+        _check_auth(authorization)
+        handler = configs.gateway_for(gateway, cfg_name)
+        if handler is None:
+            return JSONResponse({"error": f"No such config: {cfg_name}"}, status_code=404)
+        return await _dispatch(handler, request, authorization)
+
+    @app.get("/mcp/{cfg_name}")
+    async def mcp_config_get(cfg_name: str):
+        return Response(status_code=405)
+
+    for cfg_name in configs.names():
+        log.info("config endpoint available: /mcp/%s (%s)", cfg_name,
+                 ", ".join(configs.specs[cfg_name].get("upstreams") or []) or "—")
 
     return app
 
@@ -493,12 +600,8 @@ def main() -> None:
         allow = DEFAULT_ALLOW
 
     tok = config.token()
-    named_configs = {
-        name: list(spec.get("upstreams") or [])
-        for name, spec in (gw_cfg.get("configs") or {}).items()
-    }
     gateway = Gateway(allow)
-    app = build_app(gateway, tok, named_configs, port=args.port)
+    app = build_app(gateway, tok, config.named_configs(), port=args.port)
 
     log.info("AW MCP Gateway (standalone) on http://%s:%d/mcp (+ ws /link)", args.host, args.port)
     log.info("local upstream allowlist: %s", ", ".join(allow) or "—")
