@@ -107,6 +107,16 @@ class ConfigGateway:
         self._roles = upstream_roles or policy_upstreams()
         self._agents_base = agents_base
 
+        # Optional profile-wide tool ACL. Patterns may target the stripped
+        # tool name (``agent_crispal_sonnet``) or qualify it with the raw
+        # upstream name (``agents-platform-runners__agent_crispal_sonnet``).
+        # Missing means unrestricted for backwards compatibility; when set it
+        # is enforced both while advertising tools and again at call time.
+        raw_tools_allow = spec.get("tools_allow")
+        if isinstance(raw_tools_allow, str):
+            raw_tools_allow = [raw_tools_allow]
+        self._tools_allow = [str(p) for p in (raw_tools_allow or []) if p]
+
         # A profile-level knowledge-base scope (str or list[str], None =
         # unrestricted) — enforced server-side regardless of what the caller
         # passes, so one shared index can be sliced per profile.
@@ -136,6 +146,14 @@ class ConfigGateway:
 
     def _is_role(self, upstream: str, role: str) -> bool:
         return upstream in self._roles.get(role, set())
+
+    def _tool_allowed(self, upstream: str, tool: str) -> bool:
+        if not self._tools_allow:
+            return True
+        qualified = f"{upstream}__{tool}"
+        return any(fnmatch.fnmatchcase(tool, pattern)
+                   or fnmatch.fnmatchcase(qualified, pattern)
+                   for pattern in self._tools_allow)
 
     # ── Run-policy helpers ───────────────────────────────────────────────────
 
@@ -304,6 +322,8 @@ class ConfigGateway:
             upstream, real_tool = route[0], route[1]
             if upstream not in self._allowed:
                 continue
+            if not self._tool_allowed(upstream, real_tool):
+                continue
             # Hide run-tools this profile isn't allowed to run, so tools/list
             # only advertises the runnable subset.
             if self._is_role(upstream, "agents_platform") and self._list_hidden(real_tool):
@@ -371,6 +391,8 @@ class ConfigGateway:
             return _error(error or f"Tool '{public}' is not available in this config")
         params["name"] = resolved
         upstream, tool = route
+        if not self._tool_allowed(upstream, tool):
+            return _error(f"Tool '{public}' is not available in this config")
         args = dict(params.get("arguments") or {})
 
         if self._is_role(upstream, "agents_platform"):

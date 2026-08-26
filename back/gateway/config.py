@@ -199,7 +199,7 @@ _CONFIG_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01
 #: silently persisted, so a typo shows up immediately instead of reading as a
 #: policy that is quietly doing nothing.
 CONFIG_LIST_KEYS = (
-    "upstreams",
+    "upstreams", "tools_allow",
     "run_agents_allow", "run_workflows_allow",
     "run_agents_approval", "run_workflows_approval",
     "run_agents_always_allow", "run_workflows_always_allow",

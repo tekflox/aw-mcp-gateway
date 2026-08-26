@@ -89,6 +89,32 @@ async def test_tool_outside_the_config_is_rejected():
     assert gw.upstreams["kb"].calls == []
 
 
+async def test_tool_acl_filters_list_and_rejects_direct_calls():
+    gw = _gateway({"agents-platform-runners": [
+        "agent_crispal_haiku", "agent_crispal_sonnet", "list_agents"]})
+    cgw = _cgw(gw, {"upstreams": ["agents-platform-runners"],
+                    "tools_allow": ["agent_crispal_sonnet"]})
+
+    listed = await cgw.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert [t["name"] for t in listed["result"]["tools"]] == ["agent_crispal_sonnet"]
+
+    denied = await _call(cgw, "agent_crispal_haiku")
+    assert "not available in this config" in denied["error"]["message"]
+    assert gw.upstreams["agents-platform-runners"].calls == []
+
+    assert "error" not in await _call(cgw, "agent_crispal_sonnet")
+
+
+async def test_tool_acl_supports_upstream_qualified_globs():
+    gw = _gateway({"agents-platform-runners": ["agent_crispal_sonnet"],
+                   "other": ["agent_crispal_sonnet"]})
+    cgw = _cgw(gw, {"upstreams": ["agents-platform-runners", "other"],
+                    "tools_allow": ["agents-platform-runners__agent_crispal_*"]})
+
+    listed = await cgw.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert [t["name"] for t in listed["result"]["tools"]] == ["agent_crispal_sonnet"]
+
+
 # ── Run policy ──────────────────────────────────────────────────────────────
 
 
@@ -255,6 +281,7 @@ def test_save_named_configs_normalizes_and_preserves_the_token(tmp_path, monkeyp
 
     config.save_named_configs({
         "crispal": {"upstreams": ["aw-crispal", "  ", ""],
+                    "tools_allow": "get_*",
                     "run_agents_allow": "crispal*",
                     "kb_index": ["crispal"],
                     "bogus_key": ["dropped"]},
@@ -264,6 +291,7 @@ def test_save_named_configs_normalizes_and_preserves_the_token(tmp_path, monkeyp
     assert saved["token"] == "keep-me" and saved["gateway_id"] == "abc"
     assert saved["configs"]["crispal"] == {
         "upstreams": ["aw-crispal"],
+        "tools_allow": ["get_*"],
         "run_agents_allow": ["crispal*"],
         "kb_index": "crispal",
     }
