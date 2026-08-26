@@ -287,6 +287,71 @@ def test_token_preserves_other_gateway_json_fields_when_persisting(tmp_path, mon
     assert data["workspace_name"] == "aw"
 
 
+def test_gateway_id_returns_configured_value(tmp_path, monkeypatch):
+    gw_json = tmp_path / "gateway.json"
+    _write_json(gw_json, {"gateway_id": "pinned-id"})
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
+    assert config.gateway_id() == "pinned-id"
+
+
+def test_gateway_id_mints_and_persists_when_unset(tmp_path, monkeypatch):
+    gw_json = tmp_path / "missing-gateway.json"
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
+
+    minted = config.gateway_id()
+
+    assert minted
+    assert json.loads(gw_json.read_text())["gateway_id"] == minted
+
+
+def test_gateway_id_survives_restart_by_rereading_persisted_value(tmp_path, monkeypatch):
+    """The bug this guards: gateway_id() minted a fresh token_hex(8) per
+    process because nothing was persisted, so the id a client preflighted
+    against changed on every restart. Verified against the live file on
+    2026-08-25 — gateway.json carried `token` and `upstreams` and no
+    `gateway_id` at all."""
+    gw_json = tmp_path / "gateway.json"
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
+
+    first = config.gateway_id()
+    second = config.gateway_id()
+
+    assert first == second
+
+
+def test_gateway_id_preserves_other_gateway_json_fields_when_persisting(tmp_path, monkeypatch):
+    """Persisting the id must not eat the token — they share one file and
+    are written by two independent lazy mint-on-first-use paths."""
+    gw_json = tmp_path / "gateway.json"
+    _write_json(gw_json, {"token": "existing-token", "workspace_name": "aw"})
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
+
+    minted = config.gateway_id()
+
+    data = json.loads(gw_json.read_text())
+    assert data["gateway_id"] == minted
+    assert data["token"] == "existing-token"
+    assert data["workspace_name"] == "aw"
+
+
+def test_healthz_exposes_gateway_id_and_workspace_slug(tmp_path, monkeypatch):
+    """Both fields are what lets a caller prove it reached the gateway it
+    meant to reach, without an allowlist of host spellings — and both must
+    stay unauthenticated, since the failure being diagnosed is a 401."""
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(tmp_path / "apps"))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(tmp_path / "mcp.custom.json"))
+
+    gw = Gateway([], gateway_id="gw-abc123", workspace_name="fredericowu")
+    app = build_app(gw, "secret", {})
+    with TestClient(app) as client:
+        res = client.get("/healthz")  # no Authorization header on purpose
+
+    assert res.status_code == 200
+    assert res.json()["gateway_id"] == "gw-abc123"
+    assert res.json()["workspace_slug"] == "fredericowu"
+
+
 def test_register_self_writes_in_place_over_single_file_bind_mount(tmp_path, monkeypatch):
     """Reproduces the real failure: os.replace() over a path that is itself an
     active bind-mount target raises EBUSY (can't atomically swap the mounted

@@ -362,6 +362,13 @@ def build_app(gateway: Gateway, token: str, named_configs: dict[str, list[str]] 
                 "tools": len(gateway.agg_tools),
                 "configs": list(named_configs.keys()),
                 "gateway_id": gateway.gateway_id,
+                # Which workspace this gateway belongs to. Unauthenticated on
+                # purpose, alongside gateway_id: the case a caller most needs
+                # to diagnose is the one where its bearer is REJECTED — a
+                # client that reached the wrong gateway gets a 401 and no way
+                # to tell that from a rotated token. Both fields are
+                # self-descriptive, not credentials.
+                "workspace_slug": gateway.workspace_name,
                 "federation_chain": gateway.federation_chain,
                 "federated_gateways": federated}
 

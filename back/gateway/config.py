@@ -196,15 +196,41 @@ def max_federation_depth() -> int:
 
 
 def gateway_id() -> str:
-    """A stable id for this gateway process, used in the federation
-    ancestor-chain cycle check. Configurable (``gateway_id`` in
-    gateway.json) so a deployment can pin it across restarts; otherwise a
-    fresh one is minted per process — fine for cycle detection since a
-    changed id only makes the check more conservative, never less safe."""
-    configured = (load_gateway_config().get("gateway_id") or "").strip()
+    """A stable id for THIS gateway — the thing a client uses to tell one
+    gateway apart from another that happens to answer on the same port.
+
+    Mints one and persists it back to ``config/gateway.json`` on first use,
+    exactly like ``token()`` below and for the same reason: without the
+    persist, every restart minted a fresh ``secrets.token_hex(8)`` that lived
+    only in memory, so the id was stable for the length of one process and
+    meaningless to anyone who wrote it down.
+
+    That was tolerable while the only consumer was the federation
+    ancestor-chain cycle check (``GatewayUpstream.start()``), where a changed
+    id only makes the check more conservative. It is not tolerable now that
+    the id is an *identity*: a caller preflighting ``/healthz`` to confirm it
+    reached the gateway it meant to reach needs an answer that survives a
+    restart, or the check turns into a coin flip on the deploy schedule.
+
+    Falls back to a process-only ephemeral id (and warns) only if the persist
+    write itself fails — same degradation as ``token()``.
+    """
+    cfg = load_gateway_config()
+    configured = (cfg.get("gateway_id") or "").strip()
     if configured:
         return configured
-    return secrets.token_hex(8)
+    gid = secrets.token_hex(8)
+    import logging
+    log = logging.getLogger("aw-mcp-gateway")
+    cfg["gateway_id"] = gid
+    try:
+        _write_json(GATEWAY_JSON, cfg)
+        log.info("minted and persisted a new gateway_id to %s", GATEWAY_JSON)
+    except OSError as e:
+        log.warning(
+            "no 'gateway_id' in config/gateway.json and could not persist a new one "
+            "(%s) — using an EPHEMERAL id for this process only: %s", e, gid)
+    return gid
 
 
 def workspace_name() -> str:
