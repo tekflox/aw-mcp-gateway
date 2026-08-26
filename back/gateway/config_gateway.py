@@ -72,11 +72,15 @@ class ConfigGateway:
     # Tools on the knowledge-base upstream that accept a gateway-injected scope.
     _KB_SCOPED_TOOLS = {"search_knowledge_base", "update_knowledge_base",
                         "delete_knowledge_base"}
-    # Same pattern for presentations.
+    # Same pattern for presentations. ``create_presentation_from_file`` and
+    # ``commented_file`` are NOT in the monolith's original list because that
+    # server had no such tools — but they both CREATE a presentation, so
+    # leaving them out would be a hole: a scoped profile could mint an
+    # untagged presentation and walk straight out of its namespace.
     _PRESENTATION_SCOPED_TOOLS = {
         "create_presentation", "update_presentation", "delete_presentation",
         "list_presentations", "export_presentation_to_image", "share_presentation",
-        "show_image",
+        "show_image", "create_presentation_from_file", "commented_file",
     }
 
     # ── Run entrypoints on the agents-platform upstream ──────────────────────
