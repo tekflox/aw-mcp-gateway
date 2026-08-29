@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "mcp-gateway",
   "name": "MCP Gateway",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "description": "Share your workspace's tools with any AI agent, and reach tools from other workspaces in return. Install MCP Gateway and every tool your other apps expose becomes instantly callable \u2014 no per-app setup. Connect it to another gateway to pull in that workspace's tools too, with per-connection access tokens you control.",
   "tier": "container",
   "publisher": "TekFlox",
@@ -68,7 +68,7 @@
         "type": "string",
         "x-secret": true,
         "title": "Warm-token Redis URL",
-        "description": "Full redis:// URL (with password + db index) of the SAME Redis agents-platform-multitenant uses for its X-Aw-Warm-Token → current-run-id mapping (its AP_REDIS_URL/AGENTS_REDIS_URL — same instance as this workspace's other shared Redis, but check the db index matches; AW_REDIS_URL elsewhere in this deployment is on a DIFFERENT db and will not work here). Leave blank to skip warm-token resolution entirely — X-Aw-Caller-Run-Id is then forwarded as-is, exactly like before this feature existed (safe default, just misattributes caller identity in warm containers, same as today)."
+        "description": "Full redis:// URL (with password + db index) of the SAME Redis agents-platform-multitenant uses for its X-Aw-Warm-Token \u2192 current-run-id mapping (its AP_REDIS_URL/AGENTS_REDIS_URL \u2014 same instance as this workspace's other shared Redis, but check the db index matches; AW_REDIS_URL elsewhere in this deployment is on a DIFFERENT db and will not work here). Leave blank to skip warm-token resolution entirely \u2014 X-Aw-Caller-Run-Id is then forwarded as-is, exactly like before this feature existed (safe default, just misattributes caller identity in warm containers, same as today)."
       }
     },
     "required": []
