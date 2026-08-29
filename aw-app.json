@@ -16,7 +16,8 @@
     "port": 9200,
     "env": {
       "AW_APP_SCAN_ROOTS": "/opt/aw-workspace/apps",
-      "AW_HOST_MCP_JSON": "/host-mcp.json"
+      "AW_HOST_MCP_JSON": "/host-mcp.json",
+      "AW_MCP_GATEWAY_WARM_REDIS_URL": "${config.warm_redis_url}"
     },
     "volumes": [
       {
@@ -62,6 +63,12 @@
         "default": false,
         "title": "Public",
         "description": "Expose the gateway through the workspace public routing layer."
+      },
+      "warm_redis_url": {
+        "type": "string",
+        "x-secret": true,
+        "title": "Warm-token Redis URL",
+        "description": "Full redis:// URL (with password + db index) of the SAME Redis agents-platform-multitenant uses for its X-Aw-Warm-Token → current-run-id mapping (its AP_REDIS_URL/AGENTS_REDIS_URL — same instance as this workspace's other shared Redis, but check the db index matches; AW_REDIS_URL elsewhere in this deployment is on a DIFFERENT db and will not work here). Leave blank to skip warm-token resolution entirely — X-Aw-Caller-Run-Id is then forwarded as-is, exactly like before this feature existed (safe default, just misattributes caller identity in warm containers, same as today)."
       }
     },
     "required": []
