@@ -380,7 +380,7 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
     async def _dispatch(handler, request: Request, authorization: str | None) -> Response:
         _check_auth(authorization)
         # Before any upstream call in this request's task — see caller_context.
-        caller_context.capture(request.headers)
+        await caller_context.capture(request.headers)
         body = await request.json()
         messages = body if isinstance(body, list) else [body]
         responses = []

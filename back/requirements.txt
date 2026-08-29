@@ -2,6 +2,11 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 httpx>=0.27
 websockets>=12.0
+# caller_context.py's warm-token resolution (X-Aw-Warm-Token -> current
+# run_id) — degrades to no-op if AW_MCP_GATEWAY_WARM_REDIS_URL/
+# AW_SHARED_REDIS_URL is unset or unreachable, but the import itself must
+# succeed.
+redis>=5.0
 # For local stdio upstreams that are themselves built on the official MCP
 # Python SDK (today: aw-app-devctl's devctl-browser, `from mcp.server.fastmcp
 # import FastMCP`) — those apps declare this in their own aw-app.json

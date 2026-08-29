@@ -27,11 +27,11 @@ async def test_call_tool_injects_caller_run_id_into_arguments(monkeypatch):
                         "result": {"content": [], "isError": False}})
     monkeypatch.setattr(up, "_write", fake_write)
 
-    caller_context.capture({"x-aw-caller-run-id": "run-abc"})
+    await caller_context.capture({"x-aw-caller-run-id": "run-abc"})
     try:
         await up.call_tool("some_tool", {"foo": "bar"}, req_id=1)
     finally:
-        caller_context.capture({})
+        await caller_context.capture({})
 
     sent_args = written["params"]["arguments"]
     assert sent_args["_gateway_caller_run_id"] == "run-abc"
@@ -54,7 +54,7 @@ async def test_call_tool_does_not_inject_without_a_caller(monkeypatch):
                         "result": {"content": [], "isError": False}})
     monkeypatch.setattr(up, "_write", fake_write)
 
-    caller_context.capture({})
+    await caller_context.capture({})
     await up.call_tool("some_tool", {"foo": "bar"}, req_id=2)
 
     assert written["params"]["arguments"] == {"foo": "bar"}
@@ -76,10 +76,10 @@ async def test_call_tool_does_not_override_an_explicit_caller_run_id(monkeypatch
                         "result": {"content": [], "isError": False}})
     monkeypatch.setattr(up, "_write", fake_write)
 
-    caller_context.capture({"x-aw-caller-run-id": "run-abc"})
+    await caller_context.capture({"x-aw-caller-run-id": "run-abc"})
     try:
         await up.call_tool("some_tool", {"_gateway_caller_run_id": "explicit"}, req_id=3)
     finally:
-        caller_context.capture({})
+        await caller_context.capture({})
 
     assert written["params"]["arguments"]["_gateway_caller_run_id"] == "explicit"
