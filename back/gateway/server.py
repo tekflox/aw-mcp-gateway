@@ -141,6 +141,22 @@ class Gateway:
         except Exception as exc:
             log.exception("failed to start upstream %s", name)
             return str(exc)
+        if not up.tools:
+            # up.start() raised nothing, but published no tools — as
+            # unhealthy as a raise (e.g. agents-platform-runners' tools/list
+            # handler hitting AP-MT while it's down) and must go through the
+            # same failure path, or reload() settles it into `unchanged`
+            # forever instead of parking/retrying it (resilience:gateway-
+            # zero-tool-start-is-unparked-classe-b). Kind-agnostic: catches
+            # stdio, http and federated-gateway upstreams alike.
+            error = f"upstream '{name}' started but published zero tools"
+            log.error(error)
+            metrics.counters.record(name, "upstream_started_empty")
+            try:
+                await up.stop()
+            except Exception:
+                log.exception("failed to stop zero-tool upstream %s during cleanup", name)
+            return error
         self.upstreams[name] = up
         for tool in up.tools:
             self._add_route(name, tool)

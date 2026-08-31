@@ -82,6 +82,7 @@ class RollingCounters:
                     for cls in ERROR_CLASSES
                 },
                 "upstream_unavailable_seconds": self.total(name, "upstream_unavailable_seconds", now),
+                "upstream_started_empty": self.total(name, "upstream_started_empty", now),
             }
         return out
 

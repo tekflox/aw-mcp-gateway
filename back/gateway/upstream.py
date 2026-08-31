@@ -155,6 +155,15 @@ class Upstream:
         await self._write({"jsonrpc": "2.0", "method": "notifications/initialized"})
         await self._write({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"})
         listed = await self._read_direct()
+        if listed and "error" in listed:
+            # A JSON-RPC error response (e.g. the child's tools/list handler
+            # raised — mcp.server.lowlevel.Server._handle_request turns an
+            # uncaught handler exception into exactly this shape) is NOT the
+            # same thing as "this upstream legitimately has no tools". Used
+            # to fall straight into .get("result", {}).get("tools", [])
+            # below and silently become an empty-but-"successful" start —
+            # resilience:gateway-zero-tool-start-is-unparked-classe-b.
+            raise RuntimeError(f"tools/list returned an error: {listed['error']}")
         self.tools = (listed or {}).get("result", {}).get("tools", [])
 
     async def _write(self, msg: dict) -> None:
