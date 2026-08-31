@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import time
 
 from fastapi import FastAPI, Header, Request, WebSocket
 
@@ -34,6 +35,14 @@ log = logging.getLogger("aw-mcp-gateway")
 
 DEFAULT_ALLOW: list[str] = []  # empty = nothing local unless config/mcp.json + gateway.json say so
 
+# How long a parked upstream (routes kept published, but not actually live)
+# is retried before its routes are dropped for real. ~10x runtime.py's
+# DEFAULT_MCP_RESCAN_INTERVAL_S=60 — long enough to ride out a core
+# restart/deploy blip, short enough that a genuinely dead upstream doesn't
+# haunt tools/list forever and become the orphan-route problem tracked by
+# degraded:app-uninstall-leaves-stale-gateway-mcp-entry.
+PARK_TTL_SECONDS = 600
+
 
 class Gateway:
     def __init__(self, allow: list[str], gateway_id: str | None = None, max_federation_depth: int | None = None,
@@ -47,6 +56,14 @@ class Gateway:
         self.remotes: dict[str, RemoteUpstream] = {}  # public route_name -> RemoteUpstream (live only)
         self.routes: dict[str, tuple[str, str]] = {}  # public name -> (server, tool)
         self.agg_tools: list[dict] = []
+        # A local upstream that HAD published routes and then failed to
+        # (re)start — never touches self.routes/self.agg_tools shape (see the
+        # tuple-index warning on _drop_local_routes below); tracked entirely
+        # separately so a route being "parked" is invisible to every other
+        # reader of self.routes. name -> {"error": str, "parked_at": float
+        # (time.monotonic), "tools": list[dict] (raw, pre-namespacing, for
+        # restoring routes on repeated failure)}.
+        self.unavailable: dict[str, dict] = {}
         # Reconnect-safe / collision-safe remote naming (see register_remote):
         self._remote_by_token: dict[str, RemoteUpstream] = {}  # token_id -> RemoteUpstream, survives disconnects
         self._remote_name_groups: dict[str, list[str]] = {}  # workspace+base_name -> [token_id, ...] order
@@ -131,6 +148,38 @@ class Gateway:
                           if self.routes.get(t["name"], ("",))[0] != server]
         self.routes = {k: v for k, v in self.routes.items() if v[0] != server}
 
+    def _park(self, name: str, error: str, tools: list[dict]) -> None:
+        """Mark `name` unavailable — the caller has ALREADY restored its
+        routes via `_add_route` before calling this, so tools/list keeps
+        listing them and tools/call gets a retryable error (see handle())
+        instead of Unknown tool. Preserves the original parked_at across
+        repeated failed retries, so the TTL counts from the first failure,
+        not the most recent one."""
+        existing = self.unavailable.get(name)
+        self.unavailable[name] = {
+            "error": error,
+            "parked_at": existing["parked_at"] if existing else time.monotonic(),
+            "tools": tools,
+        }
+
+    def _unpark(self, name: str) -> None:
+        self.unavailable.pop(name, None)
+
+    def _expire_parked(self) -> list[str]:
+        """Give up on any upstream parked longer than PARK_TTL_SECONDS
+        without recovering — drop its by-now-stale routes so tools/list
+        stops claiming it's available. It still gets a fresh start attempt
+        every reload regardless (falls through to the 'added' path below,
+        same as an upstream nobody has parked yet) — only the parked
+        bookkeeping and its TTL clock reset."""
+        now = time.monotonic()
+        expired = [name for name, info in self.unavailable.items()
+                  if now - info["parked_at"] > PARK_TTL_SECONDS]
+        for name in expired:
+            self.unavailable.pop(name, None)
+            self._drop_local_routes(name)
+        return expired
+
     async def reload(self) -> dict:
         """Re-scan config/mcp.json (apps + config/mcp.custom.json) and
         reconcile the running local upstreams to match it — WITHOUT
@@ -138,47 +187,89 @@ class Gateway:
         (remote upstreams, /link connectors) is undisturbed.
 
         Diffs old vs new specs by name:
-        * removed (no longer in config) — stopped, routes dropped.
+        * removed (no longer in config — a real uninstall/disable) —
+          stopped, routes dropped immediately. Never parked, regardless of
+          how it's currently doing — an intentional removal must not linger.
         * changed (same name, different spec — e.g. an app's settings
-          save changed its mcp.json) — stopped then restarted fresh.
-        * added (new name) — started fresh.
-        * unchanged — left running as-is, no reconnect churn.
+          save changed its mcp.json) — stopped then restarted fresh. On
+          failure, PARKED: routes stay published and the old process is
+          gone, but the name isn't left routeless (see _park below).
+        * parked-retry (currently unavailable, still in config) — always
+          gets a fresh start attempt, spec-equality is meaningless since
+          nothing of it is actually running. This is what lets a parked
+          upstream heal on its own once the core/whatever it depends on
+          comes back, without this card's sibling (proof-gated retry with
+          backoff) having to exist yet.
+        * added (new name) — started fresh. Nothing to park on failure —
+          it never had routes to begin with.
+        * unchanged (live, same spec) — left running as-is, no reconnect
+          churn.
 
         Called by aw-workspace after an app with `contributes.mcp: true`
         saves its config (that app is expected to have already rewritten
         its own mcp.json to disk BEFORE this fires) — see aw-workspace's
-        save_app_config route.
+        save_app_config route. Also called periodically by aw-workspace's
+        own rescan (src/apps/runtime.py, up to DEFAULT_MCP_RESCAN_INTERVAL_S
+        seconds apart), which is what drives the parked-retry path above.
         """
+        self._expire_parked()
         new_specs = self._load_specs()
-        old_names = set(self.upstreams)
+        old_names = set(self.upstreams) | set(self.unavailable)
         new_names = set(new_specs)
 
         removed = old_names - new_names
         added = new_names - old_names
         common = old_names & new_names
-        changed = {n for n in common if self.upstreams[n].spec != new_specs[n]}
-        unchanged = common - changed
+        parked_retry = {n for n in common if n in self.unavailable}
+        changed = {n for n in common
+                  if n not in self.unavailable and self.upstreams[n].spec != new_specs[n]}
+        unchanged = common - changed - parked_retry
 
-        for name in removed | changed:
+        # Real config removal — dropped right away, never parked. Only a
+        # name that FAILS to (re)start below gets parked, with a TTL.
+        for name in removed:
             up = self.upstreams.pop(name, None)
             if up is not None:
                 await up.stop()
             self._drop_local_routes(name)
+            self._unpark(name)
 
         failed: list[dict] = []
-        for name in sorted(added | changed):
+        for name in sorted(added | changed | parked_retry):
+            prior_tools: list[dict] | None = None
+            if name in changed:
+                prior_up = self.upstreams.pop(name, None)
+                if prior_up is not None:
+                    prior_tools = list(prior_up.tools)
+                    await prior_up.stop()
+                self._drop_local_routes(name)
+            elif name in parked_retry:
+                prior_tools = list(self.unavailable[name].get("tools") or [])
+                self._drop_local_routes(name)
+
             error = await self._start_one(name, new_specs[name])
             if error:
                 failed.append({"name": name, "error": error})
+                if prior_tools is not None:
+                    # Had routes published before this attempt — restore
+                    # them instead of leaving the name routeless. This is
+                    # the actual fix: tools/list keeps listing it, and
+                    # handle()'s tools/call now returns a retryable error
+                    # instead of "Unknown tool" for it.
+                    for t in prior_tools:
+                        self._add_route(name, t)
+                    self._park(name, error, prior_tools)
+            else:
+                self._unpark(name)
 
-        log.info("gateway reload: +%d -%d ~%d changed, %d unchanged, %d failed — "
+        log.info("gateway reload: +%d -%d ~%d changed, %d unchanged, %d failed, %d parked — "
                  "%d local upstreams, %d tools now",
                  len(added), len(removed), len(changed), len(unchanged), len(failed),
-                 len(self.upstreams), len(self.agg_tools))
+                 len(self.unavailable), len(self.upstreams), len(self.agg_tools))
         return {
             "added": sorted(added), "removed": sorted(removed),
             "changed": sorted(changed), "unchanged": sorted(unchanged),
-            "failed": failed,
+            "failed": failed, "parked": sorted(self.unavailable),
             "upstreams": sorted(self.upstreams), "tools": len(self.agg_tools),
         }
 
@@ -300,6 +391,20 @@ class Gateway:
                 return {"jsonrpc": "2.0", "id": req_id, "error": {
                     "code": -32602, "message": f"Unknown tool: {public}"}}
             server, tool = route
+            parked = self.unavailable.get(server)
+            if parked is not None:
+                # The route is real — it's still in tools/list — but the
+                # upstream it dispatches to just failed to (re)start. Unlike
+                # the branch above, this is RETRYABLE: an LLM that reads
+                # "Unknown tool" concludes the tool was removed and gives
+                # up; this message says try again instead. Keep the existing
+                # contract (result + isError, not a JSON-RPC exception) —
+                # every caller already handles that shape.
+                return {"jsonrpc": "2.0", "id": req_id, "result": {
+                    "content": [{"type": "text",
+                                 "text": f"upstream '{server}' temporarily unavailable, "
+                                         f"reconnecting ({parked['error']}) — retry this call"}],
+                    "isError": True}}
             arguments = dict(params.get("arguments", {}) or {})
             handler = self.upstreams.get(server) or self.remotes.get(server)
             if handler is None:
