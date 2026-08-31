@@ -66,7 +66,17 @@ FORWARDED = ("x-aw-caller-session-id", "x-aw-caller-run-id", "x-aw-caller-agent"
 #: sent it is a warm one.
 _WARM_TOKEN_HEADER = "x-aw-warm-token"
 
+#: Set by GatewayUpstream on every outbound request — never by an ordinary
+#: client — so a gateway can tell "this tools/call arrived from another
+#: gateway" apart from "this arrived straight from an agent". Not part of
+#: FORWARDED: it must be re-derived fresh at each hop (by whichever upstream
+#: object is actually making the next call), never blindly relayed, or a
+#: federated flag from hop 1 would leak into a same-request call to a
+#: completely unrelated non-federated upstream two lines below it.
+_FEDERATION_HEADER = "x-aw-gateway-federated"
+
 _caller_headers: ContextVar[dict] = ContextVar("aw_caller_headers", default={})
+_federated_inbound: ContextVar[bool] = ContextVar("aw_federated_inbound", default=False)
 
 _warm_redis = None
 _warm_redis_attempted = False
@@ -161,10 +171,26 @@ async def capture(headers) -> None:
             picked["x-aw-caller-run-id"] = resolved_run_id[:256]
 
     _caller_headers.set(picked)
+    _federated_inbound.set(bool(headers.get(_FEDERATION_HEADER)))
 
 
 def current() -> dict:
     return dict(_caller_headers.get())
 
 
-__all__ = ["capture", "current", "FORWARDED"]
+def is_federated_inbound() -> bool:
+    """True when the request this task is serving arrived from another
+    aw-mcp-gateway (a ``GatewayUpstream`` hop), not straight from an agent or
+    other end client.
+
+    Used to make retry non-recursive in a federated chain: a gateway that
+    itself received this call from an upstream gateway must NOT retry its own
+    onward call, because that outer gateway is already retrying the whole
+    round trip. Without this, a 2-hop federation multiplies a 3-attempt retry
+    into 3x3=9 real attempts against the leaf upstream — see
+    ``resilience:gateway-proof-gated-retry-with-counters``.
+    """
+    return _federated_inbound.get()
+
+
+__all__ = ["capture", "current", "is_federated_inbound", "FORWARDED"]

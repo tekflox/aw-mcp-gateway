@@ -23,13 +23,45 @@ import os
 
 import httpx
 
-from . import caller_context
+from . import caller_context, metrics
 
 from .config import BASE_DIR
 
 log = logging.getLogger("aw-mcp-gateway")
 
 DEFAULT_PROTOCOL = "2024-11-05"
+
+#: Proof-gated retry (resilience:gateway-proof-gated-retry-with-counters):
+#: 3 attempts total (1 original + 2 retries), 1s then 2s backoff between them.
+MAX_CALL_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+
+
+def _classify_call_failure(exc: Exception) -> tuple[str, bool]:
+    """(error_class, proven_no_effect) for one failed ``tools/call`` attempt.
+
+    ``proven_no_effect`` is the ONLY argument this gateway accepts for
+    retrying a tool that hasn't declared ``idempotentHint`` — the
+    generalization of ``runner.py``'s ``RETRYABLE_STATUS`` reasoning (a 404
+    never reaches ``start_job``, so nothing was created to duplicate):
+
+    * ``ConnectError``/``ConnectTimeout`` — the connection never opened, so
+      the request never left this process.
+    * A ``404``/``502`` — a router response that never reached the
+      handler on the other side.
+
+    Deliberately EXCLUDED: ``ReadTimeout`` fires *after* the request was
+    sent — the write may have landed and only the response got lost, which
+    proves nothing about whether the tool ran. Any other exception is
+    treated the same way — no proof, no free pass.
+    """
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return "upstream_error", True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return "upstream_error", exc.response.status_code in (404, 502)
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout", False
+    return "upstream_error", False
 
 
 def public_name(server: str, tool: str) -> str:
@@ -277,19 +309,56 @@ class HttpUpstream:
         self.tools = listed.get("result", {}).get("tools", [])
         log.info("http upstream %s — %d tools", self.name, len(self.tools))
 
-    async def call_tool(self, tool: str, arguments: dict, req_id) -> dict:
-        try:
-            resp = await self._post({
-                "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
-                "params": {"name": tool, "arguments": arguments},
-            })
-            resp["id"] = req_id
-            return resp
-        except Exception as exc:
-            return {"jsonrpc": "2.0", "id": req_id, "result": {
-                "content": [{"type": "text",
-                             "text": f"http upstream '{self.name}' error: {exc}"}],
-                "isError": True}}
+    async def call_tool(self, tool: str, arguments: dict, req_id, *, idempotent_hint: bool = False) -> dict:
+        # Non-recursive federation (resilience:gateway-proof-gated-retry-with-
+        # counters, decision 4): a gateway that received THIS call from
+        # another gateway must not retry its own onward call — the outer
+        # gateway is already retrying the whole round trip. Without this a
+        # 2-hop federation turns one 3-attempt retry into 3x3=9 real attempts
+        # against the leaf upstream.
+        max_attempts = 1 if caller_context.is_federated_inbound() else MAX_CALL_ATTEMPTS
+        attempt = 0
+        last_exc: Exception | None = None
+        last_class = "upstream_error"
+        last_proven = False
+        while attempt < max_attempts:
+            attempt += 1
+            try:
+                resp = await self._post({
+                    "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments},
+                })
+                resp["id"] = req_id
+                if attempt > 1:
+                    metrics.counters.record(self.name, "retry_succeeded")
+                return resp
+            except Exception as exc:
+                last_exc = exc
+                last_class, last_proven = _classify_call_failure(exc)
+                if attempt >= max_attempts or not (last_proven or idempotent_hint):
+                    break
+                metrics.counters.record(self.name, "retries")
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)])
+
+        if attempt > 1:
+            metrics.counters.record(self.name, "retries_exhausted")
+        metrics.counters.record(self.name, f"tools_call_errors.{last_class}")
+
+        # The taxonomy the card asks for, spelled out in the text an agent
+        # actually reads: "didn't reach" (safe to retry) vs "not sure" (must
+        # not blindly retry a non-idempotent tool) — collapsing both into one
+        # generic error string is exactly what let a re-reading agent
+        # duplicate a non-idempotent effect before this card.
+        if last_proven:
+            reason = "the call never reached the handler (proven — connection or routing failure, safe to retry)"
+        elif idempotent_hint:
+            reason = "delivery is uncertain, but the tool is idempotent so retrying is safe"
+        else:
+            reason = "UNCERTAIN whether the call took effect — do not blindly retry a non-idempotent action"
+        return {"jsonrpc": "2.0", "id": req_id, "result": {
+            "content": [{"type": "text",
+                         "text": f"http upstream '{self.name}' error: {reason}: {last_exc}"}],
+            "isError": True}}
 
     async def stop(self) -> None:
         if self._client is not None:
@@ -351,6 +420,14 @@ class GatewayUpstream(HttpUpstream):
         self.max_depth = max_depth
         self.remote_gateway_id: str | None = None
         self.remote_chain: list[str] = []
+
+    def _client_headers(self) -> dict[str, str]:
+        # Every request this class sends IS a gateway-to-gateway hop by
+        # definition — mark it unconditionally so the far side can make
+        # retry non-recursive (see caller_context.is_federated_inbound()).
+        headers = super()._client_headers()
+        headers["X-Aw-Gateway-Federated"] = "1"
+        return headers
 
     async def start(self) -> None:
         # Same reasoning as HttpUpstream.start(): don't let an unfollowed

@@ -18,7 +18,7 @@ from fastapi import FastAPI, Header, Request, WebSocket
 from . import caller_context
 from fastapi.responses import JSONResponse, Response
 
-from . import config
+from . import config, metrics
 from .config_gateway import ConfigGateway, policy_upstreams
 from .remote_upstream import RemoteUpstream, link_endpoint
 from .token_store import FileTokenStore, TokenStore
@@ -55,6 +55,13 @@ class Gateway:
         self.upstreams: dict[str, Upstream | HttpUpstream | GatewayUpstream] = {}
         self.remotes: dict[str, RemoteUpstream] = {}  # public route_name -> RemoteUpstream (live only)
         self.routes: dict[str, tuple[str, str]] = {}  # public name -> (server, tool)
+        # public name -> that tool's raw `annotations` dict (idempotentHint
+        # etc.), for the proof-gated retry policy in HttpUpstream.call_tool.
+        # Kept as its own dict rather than widening the `routes` tuple above
+        # — every `_drop_local_routes`/`_withdraw_remote` filter on it
+        # indexes by tuple position (`v[0] != server`), and a third element
+        # would silently corrupt that filter instead of erroring.
+        self.route_annotations: dict[str, dict] = {}
         self.agg_tools: list[dict] = []
         # A local upstream that HAD published routes and then failed to
         # (re)start — never touches self.routes/self.agg_tools shape (see the
@@ -147,6 +154,7 @@ class Gateway:
         self.agg_tools = [t for t in self.agg_tools
                           if self.routes.get(t["name"], ("",))[0] != server]
         self.routes = {k: v for k, v in self.routes.items() if v[0] != server}
+        self.route_annotations = {k: v for k, v in self.route_annotations.items() if k in self.routes}
 
     def _park(self, name: str, error: str, tools: list[dict]) -> None:
         """Mark `name` unavailable — the caller has ALREADY restored its
@@ -163,7 +171,15 @@ class Gateway:
         }
 
     def _unpark(self, name: str) -> None:
-        self.unavailable.pop(name, None)
+        # Whatever this parking episode's total duration turned out to be —
+        # counted here (recovery), not while still ongoing, since only a
+        # CONCLUDED episode has a duration to report. See
+        # resilience:gateway-proof-gated-retry-with-counters /
+        # resilience:doctor-mcp-needs-24h-memory, the counter this feeds.
+        info = self.unavailable.pop(name, None)
+        if info is not None:
+            metrics.counters.record(name, "upstream_unavailable_seconds",
+                                    time.monotonic() - info["parked_at"])
 
     def _expire_parked(self) -> list[str]:
         """Give up on any upstream parked longer than PARK_TTL_SECONDS
@@ -176,7 +192,10 @@ class Gateway:
         expired = [name for name, info in self.unavailable.items()
                   if now - info["parked_at"] > PARK_TTL_SECONDS]
         for name in expired:
-            self.unavailable.pop(name, None)
+            info = self.unavailable.pop(name, None)
+            if info is not None:
+                metrics.counters.record(name, "upstream_unavailable_seconds",
+                                        now - info["parked_at"])
             self._drop_local_routes(name)
         return expired
 
@@ -284,6 +303,7 @@ class Gateway:
         t["description"] = f"[{server}] {t.get('description', '')}".strip()
         self.agg_tools.append(t)
         self.routes[public] = (server, tool["name"])
+        self.route_annotations[public] = dict(tool.get("annotations") or {})
 
     @property
     def federation_chain(self) -> list[str]:
@@ -358,6 +378,7 @@ class Gateway:
         self.agg_tools = [t for t in self.agg_tools
                           if self.routes.get(t["name"], ("",))[0] != remote.route_name]
         self.routes = {k: v for k, v in self.routes.items() if v[0] != remote.route_name}
+        self.route_annotations = {k: v for k, v in self.route_annotations.items() if k in self.routes}
 
     def unregister_remote(self, remote: RemoteUpstream) -> None:
         self._withdraw_remote(remote)
@@ -388,6 +409,7 @@ class Gateway:
             public = params.get("name", "")
             route = self.routes.get(public)
             if not route:
+                metrics.counters.record(metrics.UNROUTED, "tools_call_errors.unknown_tool")
                 return {"jsonrpc": "2.0", "id": req_id, "error": {
                     "code": -32602, "message": f"Unknown tool: {public}"}}
             server, tool = route
@@ -410,6 +432,14 @@ class Gateway:
             if handler is None:
                 return {"jsonrpc": "2.0", "id": req_id, "error": {
                     "code": -32602, "message": f"Upstream '{server}' is not connected"}}
+            if isinstance(handler, HttpUpstream):
+                # Only the HTTP family (HttpUpstream + GatewayUpstream) has
+                # the proof-gated retry loop — the stdio path is a different
+                # beast (Upstream._ensure_alive already respawns a dead
+                # child) and isn't touched here.
+                annotations = self.route_annotations.get(public) or {}
+                return await handler.call_tool(tool, arguments, req_id,
+                                               idempotent_hint=bool(annotations.get("idempotentHint")))
             return await handler.call_tool(tool, arguments, req_id)
 
         return {"jsonrpc": "2.0", "id": req_id, "error": {
@@ -501,6 +531,7 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
     @app.get("/healthz")
     async def healthz():
         federated = [name for name, up in gateway.upstreams.items() if isinstance(up, GatewayUpstream)]
+        upstream_names = set(gateway.upstreams) | set(gateway.remotes) | set(gateway.unavailable)
         return {"ok": True,
                 "local_upstreams": list(gateway.upstreams),
                 "remote_upstreams": list(gateway.remotes),
@@ -515,7 +546,20 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
                 # self-descriptive, not credentials.
                 "workspace_slug": gateway.workspace_name,
                 "federation_chain": gateway.federation_chain,
-                "federated_gateways": federated}
+                "federated_gateways": federated,
+                # 24h rolling-window resilience counters —
+                # resilience:gateway-proof-gated-retry-with-counters. This is
+                # the memory the sibling doctor card
+                # (resilience:doctor-mcp-needs-24h-memory) reads: retries and
+                # retries_exhausted are the companion no retry above is
+                # allowed to ship without, tools_call_errors.unknown_tool
+                # rising means the route-parking mechanism regressed, and
+                # upstream_unavailable_seconds is what would have caught the
+                # 2026-08-30 blips a present-tense /healthz check couldn't.
+                "resilience": {
+                    "window_seconds": metrics.WINDOW_SECONDS,
+                    "by_upstream": metrics.counters.snapshot(list(upstream_names)),
+                }}
 
     @app.post("/mcp")
     async def mcp_post(request: Request, authorization: str | None = Header(default=None)):
