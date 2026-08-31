@@ -33,6 +33,7 @@ import time
 from fastapi import WebSocket, WebSocketDisconnect
 
 from .token_store import TokenStore
+from .upstream import next_wire_id
 
 log = logging.getLogger("aw-mcp-gateway")
 
@@ -72,11 +73,14 @@ class RemoteUpstream:
     async def call_tool(self, tool: str, arguments: dict, req_id) -> dict:
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
-        key = str(req_id)
+        # One WebSocket serves every concurrent caller, so — exactly as in the
+        # stdio ``Upstream`` — the pending-map key must be unique to this
+        # gateway process, not the caller's own colliding JSON-RPC id.
+        key = next_wire_id()
         self._pending[key] = fut
         try:
             await self.websocket.send_json({
-                "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+                "jsonrpc": "2.0", "id": key, "method": "tools/call",
                 "params": {"name": tool, "arguments": arguments},
             })
         except Exception as exc:
@@ -86,7 +90,10 @@ class RemoteUpstream:
                              "text": f"remote upstream '{self.app_name}' send failed: {exc}"}],
                 "isError": True}}
         try:
-            return await asyncio.wait_for(fut, timeout=120)
+            resp = await asyncio.wait_for(fut, timeout=120)
+            # Restore the caller's own id, which correlates the reply on their side.
+            resp["id"] = req_id
+            return resp
         except asyncio.TimeoutError:
             self._pending.pop(key, None)
             return {"jsonrpc": "2.0", "id": req_id, "result": {

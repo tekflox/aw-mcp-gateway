@@ -17,6 +17,7 @@ Design notes (unchanged from the source):
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -30,6 +31,25 @@ from .config import BASE_DIR
 log = logging.getLogger("aw-mcp-gateway")
 
 DEFAULT_PROTOCOL = "2024-11-05"
+
+#: Correlation ids owned by THIS gateway process, for the transports that
+#: multiplex many concurrent callers over ONE shared connection (the stdio
+#: ``Upstream`` child, the ``/link`` ``RemoteUpstream`` WebSocket).
+#:
+#: These used to be keyed on the caller's own JSON-RPC ``id``, taken verbatim
+#: from the inbound request in ``Gateway.handle()``. Independent MCP clients
+#: number their requests with their own per-connection counters (1, 2, 3…),
+#: so two concurrent sessions routinely pick the SAME id — and the second one
+#: silently evicted the first's future from ``_pending``, handing session B
+#: session A's result with no error while session A's call hung forever
+#: ("job cruzado", 2026-08-31). The caller's id is restored on the way back
+#: out, exactly as ``HttpUpstream.call_tool`` already does.
+_wire_ids = itertools.count(1)
+
+
+def next_wire_id() -> str:
+    """A process-unique JSON-RPC id for one in-flight call to a shared upstream."""
+    return f"awg-{next(_wire_ids)}"
 
 #: Proof-gated retry (resilience:gateway-proof-gated-retry-with-counters):
 #: 3 attempts total (1 original + 2 retries), 1s then 2s backoff between them.
@@ -206,16 +226,22 @@ class Upstream:
         if caller_run_id and "_gateway_caller_run_id" not in arguments:
             arguments = {**arguments, "_gateway_caller_run_id": caller_run_id}
 
+        # One child process serves EVERY concurrent caller, so the key this
+        # call waits on has to be unique to this gateway process — never the
+        # caller's own id, which collides across independent sessions. See
+        # next_wire_id().
+        wire_id = next_wire_id()
+
         async with self._lifecycle_lock:
             await self._ensure_alive()
-            self._pending[req_id] = fut
+            self._pending[wire_id] = fut
             try:
                 await self._write({
-                    "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+                    "jsonrpc": "2.0", "id": wire_id, "method": "tools/call",
                     "params": {"name": tool, "arguments": arguments},
                 })
             except Exception:
-                self._pending.pop(req_id, None)
+                self._pending.pop(wire_id, None)
                 raise
         resp = await fut
         if resp is None:
@@ -225,6 +251,8 @@ class Upstream:
                              "text": f"upstream '{self.name}' crashed or returned no "
                                      f"response; it will be respawned on the next call"}],
                 "isError": True}}
+        # Put the caller's own id back — it correlates the reply on their side.
+        resp["id"] = req_id
         return resp
 
     async def stop(self) -> None:
