@@ -32,6 +32,17 @@ log = logging.getLogger("aw-mcp-gateway")
 
 DEFAULT_PROTOCOL = "2024-11-05"
 
+#: A stdio child that never answers its handshake used to hang this coroutine
+#: forever — and Gateway.start() awaits each upstream SEQUENTIALLY, so one
+#: stuck child (observed: a freshly-updated container's first `npx
+#: playwright` launch, needing to install browsers) blocked every upstream
+#: after it from ever starting, which meant the FastAPI lifespan never
+#: finished and the whole gateway never bound its port ("connection
+#: refused" workspace-wide, 2026-09-03). Matches the timeout HttpUpstream
+#: already applies to its own handshake (httpx.AsyncClient(timeout=30.0)) —
+#: stdio just never got the same treatment.
+HANDSHAKE_TIMEOUT_SECONDS = 30.0
+
 #: Correlation ids owned by THIS gateway process, for the transports that
 #: multiplex many concurrent callers over ONE shared connection (the stdio
 #: ``Upstream`` child, the ``/link`` ``RemoteUpstream`` WebSocket).
@@ -167,14 +178,26 @@ class Upstream:
                 fut.set_result(msg)
 
     async def _handshake(self) -> None:
-        await self._write({"jsonrpc": "2.0", "id": "init", "method": "initialize",
-                           "params": {"protocolVersion": DEFAULT_PROTOCOL,
-                                      "capabilities": {}, "clientInfo":
-                                      {"name": "aw-mcp-gateway", "version": "1.0.0"}}})
-        await self._read_direct()
-        await self._write({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        await self._write({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"})
-        listed = await self._read_direct()
+        try:
+            await self._write({"jsonrpc": "2.0", "id": "init", "method": "initialize",
+                               "params": {"protocolVersion": DEFAULT_PROTOCOL,
+                                          "capabilities": {}, "clientInfo":
+                                          {"name": "aw-mcp-gateway", "version": "1.0.0"}}})
+            await asyncio.wait_for(self._read_direct(), timeout=HANDSHAKE_TIMEOUT_SECONDS)
+            await self._write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            await self._write({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"})
+            listed = await asyncio.wait_for(self._read_direct(), timeout=HANDSHAKE_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            # Kill the child rather than leave it running unreferenced —
+            # _reader_task hasn't been created yet at this point in
+            # _ensure_alive(), but stop() guards for that already, and
+            # still terminates self.proc so a slow-first-boot `npx` process
+            # doesn't sit there orphaned, unretried, holding the pipes open.
+            await self.stop()
+            raise RuntimeError(
+                f"upstream '{self.name}' did not answer its MCP handshake within "
+                f"{HANDSHAKE_TIMEOUT_SECONDS}s"
+            ) from None
         if listed and "error" in listed:
             # A JSON-RPC error response (e.g. the child's tools/list handler
             # raised — mcp.server.lowlevel.Server._handle_request turns an
