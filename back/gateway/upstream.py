@@ -67,6 +67,17 @@ def next_wire_id() -> str:
 MAX_CALL_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = (1.0, 2.0)
 
+#: Startup connect retry (resilience:mcp-gateway-windows-pilot-dns-race): a
+#: gateway container that just (re)started can dial an upstream before
+#: aardvark-dns has propagated a freshly (re)created container's hostname
+#: record to it — "Name or service not known" on the very first POST, even
+#: though the record resolves fine moments later from every other container
+#: on the same network. Same attempt/backoff budget as MAX_CALL_ATTEMPTS —
+#: a distinct constant because this guards the initial connection, not a
+#: tool call, and must never cover a real auth/4xx failure.
+START_CONNECT_MAX_ATTEMPTS = 3
+START_CONNECT_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+
 
 def _classify_call_failure(exc: Exception) -> tuple[str, bool]:
     """(error_class, proven_no_effect) for one failed ``tools/call`` attempt.
@@ -350,6 +361,33 @@ class HttpUpstream:
                 return json.loads(data_line)
         return resp.json()
 
+    async def _initialize_with_connect_retry(self) -> dict:
+        """The ``initialize`` POST, retried with backoff on a connection-
+        level failure only (resilience:mcp-gateway-windows-pilot-dns-race) —
+        DNS not resolving yet / connection refused means the request never
+        left this process, so retrying is always safe, unlike a proof-gated
+        ``tools/call`` retry which also has to worry about a non-idempotent
+        effect landing twice. An auth/4xx response is a real failure and
+        raises ``HTTPStatusError``, which this does not catch — it must
+        surface immediately, not be masked by a startup retry."""
+        for attempt in range(1, START_CONNECT_MAX_ATTEMPTS + 1):
+            try:
+                return await self._post({
+                    "jsonrpc": "2.0", "id": "init", "method": "initialize",
+                    "params": {"protocolVersion": DEFAULT_PROTOCOL,
+                               "capabilities": {}, "clientInfo": {"name": "aw-mcp-gateway", "version": "1.0.0"}}
+                })
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if attempt >= START_CONNECT_MAX_ATTEMPTS:
+                    raise
+                backoff = START_CONNECT_RETRY_BACKOFF_SECONDS[
+                    min(attempt - 1, len(START_CONNECT_RETRY_BACKOFF_SECONDS) - 1)]
+                log.warning(
+                    "upstream %s: connect attempt %d/%d failed, retrying in %ss",
+                    self.name, attempt, START_CONNECT_MAX_ATTEMPTS, backoff)
+                await asyncio.sleep(backoff)
+        raise AssertionError("unreachable")  # loop always returns or raises
+
     async def start(self) -> None:
         # follow_redirects: an upstream that 301s the handshake (e.g. an
         # Apache/WordPress vhost forcing canonical https) otherwise blows up
@@ -358,11 +396,7 @@ class HttpUpstream:
         # raise and the upstream would be dropped with 0 tools instead of
         # transparently following the hop like a browser would.
         self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-        init = await self._post({
-            "jsonrpc": "2.0", "id": "init", "method": "initialize",
-            "params": {"protocolVersion": DEFAULT_PROTOCOL,
-                       "capabilities": {}, "clientInfo": {"name": "aw-mcp-gateway", "version": "1.0.0"}}
-        })
+        init = await self._initialize_with_connect_retry()
         log.info("http upstream %s initialized: %s", self.name,
                  init.get("result", {}).get("serverInfo", {}).get("name", "?"))
         listed = await self._post({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"})
