@@ -9,7 +9,7 @@ jobs:
   back:
     runs-on: [self-hosted, aw-baremetal]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -43,10 +43,10 @@ jobs:
   front:
     runs-on: [self-hosted, aw-baremetal]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
       - working-directory: front
         run: npm install
       - working-directory: front
@@ -57,7 +57,7 @@ jobs:
   connector:
     runs-on: [self-hosted, aw-baremetal]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
