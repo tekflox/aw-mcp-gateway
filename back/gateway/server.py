@@ -512,6 +512,13 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         await gateway.start()
+        # Every warm claude-cli container's MCP client was built against
+        # whatever upstreams existed at ITS boot — this gateway restarting
+        # means those upstreams just got new connections underneath every
+        # such container without it knowing. Condemn them all so the next
+        # turn each one takes drains+respawns instead of talking to a dead
+        # client forever (resilience:mcp-gateway-session-auto-reconnect).
+        await caller_context.bump_warm_generation()
         config.register_self_in_host_mcp_json(port, token)
         yield
 

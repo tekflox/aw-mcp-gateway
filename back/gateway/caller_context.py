@@ -53,9 +53,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from contextvars import ContextVar
 
 log = logging.getLogger("aw-mcp-gateway.caller_context")
+
+#: Mirrors ``agents-platform``'s ``core/warm_pool.py::GENERATION_KEY`` and
+#: ``agents-platform-runners``'s ``warm_pool.py::GENERATION_KEY`` EXACTLY —
+#: same key, same shared Redis db (see ``_get_warm_redis``'s docstring below
+#: for why the db number matters). A SET here condemns every warm claude-cli
+#: container, native and runner, in one write; each consumer just compares
+#: its own label against the current value on its next dispatch. Both of
+#: those modules already document "mcp-gateway starting/restarting" as a
+#: trigger for this key — this gateway is the missing owner of that event.
+GENERATION_KEY = "warm:config_generation"
 
 #: Inbound headers forwarded to upstreams, lowercase. Keep this short and
 #: boring — every addition is something a caller can now assert about itself.
@@ -117,6 +128,40 @@ async def _get_warm_redis():
         log.warning("warm-token Redis unavailable (%s) — X-Aw-Warm-Token will no-op", e)
         _warm_redis = None
     return _warm_redis
+
+
+async def bump_warm_generation() -> None:
+    """Condemn every warm claude-cli container — native and runner — so the
+    next dispatch to each one drains it and starts fresh instead of reusing
+    a process whose MCP client was built against upstreams that no longer
+    exist (see module docstring: those clients are built once at CLI boot
+    and never reinitialized). Call this once, from the gateway's own
+    startup, after every upstream is up.
+
+    Deliberately reuses ``_get_warm_redis()`` — the SAME client/db as
+    warm-token resolution above — rather than a new env var: pointing this
+    at the wrong db would degrade to a silent no-op forever, exactly the
+    trap ``_get_warm_redis``'s docstring already documents.
+
+    Best-effort and never raises: a failed bump just leaves warm containers
+    serving a dead MCP client until the next successful one, no worse than
+    before this existed. Idempotent and lazy by design — like the two
+    consumers of this key, a bump only marks containers stale; nothing is
+    killed synchronously, so repeated calls (five restarts in a row) cost
+    no more than one.
+    """
+    r = await _get_warm_redis()
+    if r is None:
+        log.warning("bump_warm_generation: no warm Redis available at startup — "
+                    "warm containers will NOT be invalidated by this restart")
+        return
+    try:
+        await r.set(GENERATION_KEY, str(time.time()))
+        log.info("bump_warm_generation: SET %s — every warm claude-cli container "
+                 "is now condemned and will drain+respawn on its next turn", GENERATION_KEY)
+    except Exception as e:
+        log.warning("bump_warm_generation: Redis write failed (%s) — warm "
+                    "containers will NOT be invalidated by this restart", e)
 
 
 async def _resolve_warm_token(token: str) -> str | None:
@@ -193,4 +238,4 @@ def is_federated_inbound() -> bool:
     return _federated_inbound.get()
 
 
-__all__ = ["capture", "current", "is_federated_inbound", "FORWARDED"]
+__all__ = ["capture", "current", "is_federated_inbound", "FORWARDED", "bump_warm_generation"]
