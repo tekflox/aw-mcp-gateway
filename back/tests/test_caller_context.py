@@ -115,9 +115,13 @@ def test_the_agent_identity_is_forwarded_too():
 class _FakeRedis:
     def __init__(self, values: dict):
         self._values = values
+        self.sets: list[tuple[str, str]] = []
 
     async def get(self, key):
         return self._values.get(key)
+
+    async def set(self, key, value):
+        self.sets.append((key, value))
 
 
 def test_warm_token_resolves_to_the_current_run_id(monkeypatch):
@@ -193,3 +197,38 @@ def test_no_warm_token_leaves_the_raw_header_untouched(monkeypatch):
     _capture({"x-aw-caller-run-id": "run-abc"})
 
     assert caller_context.current() == {"x-aw-caller-run-id": "run-abc"}
+
+
+def test_bump_warm_generation_sets_the_shared_key(monkeypatch):
+    """Must be the literal string AP-MT's and runners' own warm_pool.py use
+    for GENERATION_KEY — a typo here means this gateway's restarts silently
+    stop invalidating anything, forever, with no error."""
+    fake = _FakeRedis({})
+    monkeypatch.setattr(caller_context, "_get_warm_redis", lambda: _async(fake))
+
+    asyncio.run(caller_context.bump_warm_generation())
+
+    assert fake.sets == [("warm:config_generation", fake.sets[0][1])]
+    assert fake.sets[0][0] == caller_context.GENERATION_KEY
+    float(fake.sets[0][1])  # a bare timestamp, not a JSON blob
+
+
+def test_bump_warm_generation_is_a_noop_without_redis(monkeypatch):
+    """Best-effort: no warm Redis configured must not raise."""
+    monkeypatch.setattr(caller_context, "_get_warm_redis", lambda: _async(None))
+
+    asyncio.run(caller_context.bump_warm_generation())  # must not raise
+
+
+def test_bump_warm_generation_survives_a_write_failure(monkeypatch):
+    class _BoomRedis:
+        async def set(self, key, value):
+            raise ConnectionError("redis unreachable")
+
+    monkeypatch.setattr(caller_context, "_get_warm_redis", lambda: _async(_BoomRedis()))
+
+    asyncio.run(caller_context.bump_warm_generation())  # must not raise
+
+
+async def _async(value):
+    return value
