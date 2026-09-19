@@ -15,12 +15,24 @@ right after every upstream is up, reusing the same Redis client
 """
 from __future__ import annotations
 
+import pytest
 from starlette.testclient import TestClient
 
-from gateway import caller_context, config
+from gateway import caller_context, config, metrics, warm_redis
 from gateway.server import Gateway, build_app
 
 TOKEN = "test-token"
+
+
+@pytest.fixture(autouse=True)
+def _reset_warm_token_counters():
+    """metrics.counters is a process-wide singleton (see
+    test_proof_gated_retry.py's identical fixture) — this file's new
+    healthz test asserts exact tokens_seen_24h/tokens_unresolved_24h
+    values, which must not depend on what ran before it."""
+    metrics.counters._events.clear()
+    yield
+    metrics.counters._events.clear()
 
 
 class _FakeRedis:
@@ -83,3 +95,26 @@ def test_lifespan_survives_warm_redis_write_failing(tmp_path, monkeypatch):
 
     with TestClient(_app(tmp_path, monkeypatch)) as client:
         assert client.get("/healthz").status_code == 200
+
+
+def test_healthz_reports_the_warm_redis_block(tmp_path, monkeypatch):
+    """The actual point of this card: an unconfigured/unreachable warm Redis
+    used to be a total, silent outage — this is the doctor-visible signal
+    that replaces the one INFO line at boot."""
+    async def fake_get_warm_redis():
+        return None
+    monkeypatch.setattr(caller_context, "_get_warm_redis", fake_get_warm_redis)
+    monkeypatch.setattr(warm_redis, "resolve",
+                         lambda: warm_redis.Resolution("redis://:secret@example:6379/1", "probed"))
+
+    with TestClient(_app(tmp_path, monkeypatch)) as client:
+        body = client.get("/healthz").json()
+
+    assert body["warm_redis"] == {
+        "ok": False,  # resolved but unreachable
+        "url": "redis://***@example:6379/1",
+        "source": "probed",
+        "reachable": False,
+        "tokens_seen_24h": 0,
+        "tokens_unresolved_24h": 0,
+    }

@@ -556,6 +556,16 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
         federated = [name for name, up in gateway.upstreams.items() if isinstance(up, GatewayUpstream)]
         upstream_names = set(gateway.upstreams) | set(gateway.remotes) | set(gateway.unavailable)
         return {"ok": True,
+                # An unresolvable warm-token Redis is a total, silent outage
+                # for every caller-identity-dependent MCP tool on a warm
+                # Runner-provider container (schedule_wakeup, ask_human,
+                # mark_flow_done, supervise, async callbacks) — see
+                # caller_context.py's module docstring for why there is no
+                # safe-degrade path left for that topology. Its own `ok`
+                # nested here (not folded into the top-level one, which
+                # tracks whether THIS gateway process answered at all) is
+                # what the core-side doctor check reads.
+                "warm_redis": await caller_context.warm_redis_status(),
                 "local_upstreams": list(gateway.upstreams),
                 "remote_upstreams": list(gateway.remotes),
                 "tools": len(gateway.agg_tools),

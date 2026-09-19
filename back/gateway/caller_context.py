@@ -43,18 +43,23 @@ Resolution happens here, at capture time, so every downstream consumer —
 ``HttpUpstream``'s forwarded headers, including whatever aw-app-secrets does
 with them — gets the corrected value for free, with no other file needing to
 change. When ``x-aw-warm-token`` is absent, or Redis is unreachable, or the
-token is unmapped, this degrades to the raw ``x-aw-caller-run-id`` header
-exactly as before — never worse than today, and safe to deploy standalone
-before AP-MT starts sending the new header (see ``_resolve_warm_token``'s
-docstring for why the redis db number matters here specifically).
+token is unmapped, this degrades to the raw ``x-aw-caller-run-id`` header —
+but as of 2026-09-19 that is no longer "never worse than today" for a warm
+Runner-provider container: ``execute.py`` deliberately strips its own
+``X-Aw-Caller-Run-Id`` fallback header (a stale header would otherwise
+silently beat a fresh Redis value), so for that topology an unresolvable
+warm Redis is a total, silent outage, not a graceful degrade. That is why
+resolution here now fails LOUDLY (see ``_warn_unresolved`` and
+``warm_redis_status``) instead of only logging once at boot.
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from contextvars import ContextVar
+
+from . import metrics, warm_redis
 
 log = logging.getLogger("aw-mcp-gateway.caller_context")
 
@@ -90,42 +95,72 @@ _caller_headers: ContextVar[dict] = ContextVar("aw_caller_headers", default={})
 _federated_inbound: ContextVar[bool] = ContextVar("aw_federated_inbound", default=False)
 
 _warm_redis = None
-_warm_redis_attempted = False
+_warm_redis_last_attempt = 0.0
+
+#: How long a failed connect attempt sticks before the next call retries —
+#: replaces a permanent latch that used to disable warm-token resolution for
+#: this process's entire life over a Redis that was merely down for one
+#: second at gateway boot.
+_WARM_REDIS_RETRY_COOLDOWN_S = 30.0
+
+
+def _redact(url: str | None) -> str | None:
+    """``redis://:password@host:port/db`` -> ``redis://***@host:port/db``.
+    Only the credential is secret; host/port/db are exactly what a human
+    debugging /healthz needs to see."""
+    if not url or "@" not in url:
+        return url
+    scheme_and_auth, _, rest = url.partition("@")
+    scheme = scheme_and_auth.partition("://")[0]
+    return f"{scheme}://***@{rest}"
 
 
 async def _get_warm_redis():
     """Shared async Redis client for warm-token resolution, or None if
-    unreachable — every caller degrades to the raw header on None, so a down
-    Redis here never breaks tool calls, only un-corrects this one thing.
+    unresolvable/unreachable — every caller degrades to the raw header on
+    None, so a down Redis here never breaks tool calls, only un-corrects
+    this one thing (see module docstring for why that degrade is no longer
+    fully safe for a warm Runner-provider container).
 
-    ``AW_MCP_GATEWAY_WARM_REDIS_URL`` must point at the SAME Redis db
-    ``agents-platform-multitenant``'s ``core/redis_streams.py::get_client()``
-    uses (``AP_REDIS_URL`` there — db 1 in this deployment), not
-    ``AW_REDIS_URL`` (db 0, a different db on the same instance): the two
-    names differ only by which app owns them, and pointing this at the wrong
-    db silently means every lookup misses, degrading forever with no error
-    (found 2026-08-29 auditing this exact mismatch in the sandbox's own
-    ``src/mcp/gateway.py`` reference implementation — worth checking there
-    too, out of scope for this module)."""
-    global _warm_redis, _warm_redis_attempted
+    The URL itself comes from ``warm_redis.resolve()`` — config override,
+    then env, then probing the docker bridge gateways — which must land on
+    the SAME Redis db ``agents-platform-multitenant``'s
+    ``core/redis_streams.py::get_client()`` uses (db 1 in this deployment),
+    not ``AW_REDIS_URL`` (a different db on the same instance): pointing this
+    at the wrong db silently means every lookup misses, degrading forever
+    with no error (found 2026-08-29 auditing this exact mismatch in the
+    sandbox's own ``src/mcp/gateway.py`` reference implementation).
+
+    A failed connect attempt is retried after ``_WARM_REDIS_RETRY_COOLDOWN_S``
+    rather than latched forever, and also drops ``warm_redis``'s own cached
+    resolution — so a probe answer that only just changed (or a Redis that
+    only just came up) gets re-discovered on the next attempt instead of
+    being pinned to the first outcome for the gateway's entire process life.
+    """
+    global _warm_redis, _warm_redis_last_attempt
     if _warm_redis is not None:
         return _warm_redis
-    if _warm_redis_attempted:
+
+    now = time.time()
+    if now - _warm_redis_last_attempt < _WARM_REDIS_RETRY_COOLDOWN_S:
         return None
-    _warm_redis_attempted = True
-    url = os.environ.get("AW_MCP_GATEWAY_WARM_REDIS_URL") or os.environ.get("AW_SHARED_REDIS_URL")
-    if not url:
-        log.info("no warm-token Redis configured (AW_MCP_GATEWAY_WARM_REDIS_URL/"
-                 "AW_SHARED_REDIS_URL both unset) — X-Aw-Warm-Token will no-op")
+    _warm_redis_last_attempt = now
+
+    resolution = warm_redis.resolve()
+    if not resolution.url:
         return None
     try:
         import redis.asyncio as aioredis
-        r = aioredis.from_url(url, decode_responses=True,
+        r = aioredis.from_url(resolution.url, decode_responses=True,
                               socket_connect_timeout=2, socket_timeout=2)
         await r.ping()
         _warm_redis = r
     except Exception as e:
-        log.warning("warm-token Redis unavailable (%s) — X-Aw-Warm-Token will no-op", e)
+        log.warning(
+            "warm-token Redis unavailable (%s; url=%s source=%s) — "
+            "X-Aw-Warm-Token will no-op, retrying in %ss",
+            e, _redact(resolution.url), resolution.source, int(_WARM_REDIS_RETRY_COOLDOWN_S))
+        warm_redis.reset_cache()
         _warm_redis = None
     return _warm_redis
 
@@ -193,6 +228,32 @@ async def _resolve_warm_token(token: str) -> str | None:
         return None
 
 
+#: How long a single "warm token arrived but didn't resolve" WARNING sticks
+#: before the next occurrence logs again — a sustained outage should be
+#: loud, not one line per tool call.
+_UNRESOLVED_WARNING_COOLDOWN_S = 60.0
+_last_unresolved_warning = 0.0
+
+
+def _warn_unresolved() -> None:
+    """``_resolve_warm_token`` returning None for a token that WAS present is
+    never normal — AP-MT only sends ``X-Aw-Warm-Token`` after
+    ``set_warm_token_run`` wrote the mapping. Names the resolved Redis and
+    the candidate list tried, because "it's broken" without either is not
+    actionable at 3am."""
+    global _last_unresolved_warning
+    now = time.time()
+    if now - _last_unresolved_warning < _UNRESOLVED_WARNING_COOLDOWN_S:
+        return
+    _last_unresolved_warning = now
+    resolution = warm_redis.resolve()
+    log.warning(
+        "warm-token present but did not resolve to a run_id (redis=%s source=%s, "
+        "candidates tried=%s) — X-Aw-Caller-Run-Id falls back to the stale "
+        "per-run header for every affected warm session until this is fixed",
+        _redact(resolution.url), resolution.source, ", ".join(warm_redis.candidate_hosts()))
+
+
 async def capture(headers) -> None:
     """Record the forwardable headers of the request being served.
 
@@ -211,9 +272,13 @@ async def capture(headers) -> None:
 
     warm_token = headers.get(_WARM_TOKEN_HEADER)
     if warm_token:
+        metrics.counters.record(metrics.WARM_TOKEN, "seen")
         resolved_run_id = await _resolve_warm_token(str(warm_token)[:256])
         if resolved_run_id:
             picked["x-aw-caller-run-id"] = resolved_run_id[:256]
+        else:
+            metrics.counters.record(metrics.WARM_TOKEN, "unresolved")
+            _warn_unresolved()
 
     _caller_headers.set(picked)
     _federated_inbound.set(bool(headers.get(_FEDERATION_HEADER)))
@@ -221,6 +286,48 @@ async def capture(headers) -> None:
 
 def current() -> dict:
     return dict(_caller_headers.get())
+
+
+#: A wrong-instance/wrong-db warm Redis is silent on a brand-new workspace —
+#: zero tokens have arrived yet, which must NOT read as 100% failure. Require
+#: a handful of real attempts before treating an all-failed rate as the
+#: loud signal rather than early noise.
+_MIN_TOKENS_FOR_FAILURE_SIGNAL = 5
+
+
+def _warm_redis_ok(resolution: warm_redis.Resolution, reachable: bool,
+                    tokens_seen: float, tokens_unresolved: float) -> bool:
+    if resolution.source == "none":
+        return False
+    if not reachable:
+        return False
+    if tokens_seen >= _MIN_TOKENS_FOR_FAILURE_SIGNAL and tokens_unresolved >= tokens_seen:
+        return False
+    return True
+
+
+async def warm_redis_status() -> dict:
+    """Snapshot for ``/healthz``'s ``warm_redis`` block.
+
+    Calling this attempts a connection exactly like any other warm-token
+    lookup would (subject to the same cooldown), so a doctor/monitoring poll
+    doubles as the retry trigger rather than needing its own timer — and a
+    workspace that never sees a single warm session still gets an honest
+    ``reachable``/``source`` reading the first time anything asks.
+    """
+    r = await _get_warm_redis()
+    resolution = warm_redis.resolve()
+    tokens_seen = metrics.counters.total(metrics.WARM_TOKEN, "seen")
+    tokens_unresolved = metrics.counters.total(metrics.WARM_TOKEN, "unresolved")
+    reachable = r is not None
+    return {
+        "ok": _warm_redis_ok(resolution, reachable, tokens_seen, tokens_unresolved),
+        "url": _redact(resolution.url),
+        "source": resolution.source,
+        "reachable": reachable,
+        "tokens_seen_24h": tokens_seen,
+        "tokens_unresolved_24h": tokens_unresolved,
+    }
 
 
 def is_federated_inbound() -> bool:
@@ -238,4 +345,5 @@ def is_federated_inbound() -> bool:
     return _federated_inbound.get()
 
 
-__all__ = ["capture", "current", "is_federated_inbound", "FORWARDED", "bump_warm_generation"]
+__all__ = ["capture", "current", "is_federated_inbound", "FORWARDED", "bump_warm_generation",
+           "warm_redis_status"]

@@ -2,7 +2,30 @@ from __future__ import annotations
 
 import pytest
 
-from gateway import config
+from gateway import config, warm_redis
+
+
+@pytest.fixture(autouse=True)
+def _no_real_warm_redis_probing(monkeypatch):
+    """``warm_redis.resolve()`` falls back to probing real docker-bridge
+    gateways (172.18.0.1 etc.) when no override env var is set — never
+    appropriate in a test run: slow, needs real sockets, and its answer
+    depends on whatever happens to be reachable from wherever tests run.
+    Every ``/healthz`` call now goes through this (via
+    ``caller_context.warm_redis_status()``), not just the tests that mean to
+    exercise it.
+
+    Tests that care about a specific resolution (test_warm_redis.py's own
+    probe tests, test_caller_context.py's warm-redis tests) override this
+    per-test with their own ``monkeypatch.setattr`` afterward, same
+    override-after-fixture pattern as ``_isolate_gateway_json`` below.
+    """
+    for var in ("AW_MCP_GATEWAY_WARM_REDIS_URL", "AW_SHARED_REDIS_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(warm_redis, "_accepts_tcp", lambda host, port: False)
+    warm_redis.reset_cache()
+    yield
+    warm_redis.reset_cache()
 
 
 @pytest.fixture(autouse=True)

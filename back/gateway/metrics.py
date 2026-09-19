@@ -36,6 +36,14 @@ ERROR_CLASSES = ("unknown_tool", "upstream_error", "timeout")
 # (tools/call against a name with no route at all — see Gateway.handle()).
 UNROUTED = "_unrouted"
 
+# A pseudo upstream name for warm-token caller-identity counters
+# (caller_context.py, warm_redis.py). Not really per-upstream — a warm token
+# arrives on the request, before any upstream is chosen — but RollingCounters
+# is keyed (upstream, metric), so a stable pseudo name reuses the one rolling-
+# window mechanism this module already owns instead of caller_context growing
+# its own. Feeds /healthz's warm_redis.tokens_seen_24h/tokens_unresolved_24h.
+WARM_TOKEN = "_warm_token"
+
 
 class RollingCounters:
     """Per-(upstream, metric) event log, pruned to a 24h window on read."""
