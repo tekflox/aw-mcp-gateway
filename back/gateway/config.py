@@ -277,14 +277,16 @@ def policy_upstream_overrides() -> dict:
 
 
 def agents_base(servers: dict | None = None) -> str:
-    """Base URL of the Agents Platform the approval gate should call.
+    """Base URL of the Agents Platform a profile's run-tools route to.
 
     Derived, in order, from: an explicit ``agents_base`` in
     ``config/gateway.json``; the ``env.AGENTS_BASE`` of whichever configured
     upstream fills the ``agents_platform`` role (i.e. whatever that upstream
     itself already talks to — nothing extra to configure, and it cannot drift
-    out of sync); then ``$AGENTS_BASE``. Empty if none of those exist, which
-    makes the approval gate fail closed.
+    out of sync); then ``$AGENTS_BASE``.
+
+    Reported on ``GET /admin/configs``; the human-in-the-loop approval gate no
+    longer calls it — that moved to aw-backend, see :func:`approval_backend`.
     """
     cfg = load_gateway_config()
     explicit = (cfg.get("agents_base") or "").strip()
@@ -299,6 +301,35 @@ def agents_base(servers: dict | None = None) -> str:
         if base:
             return base
     return (os.environ.get("AGENTS_BASE") or "").strip()
+
+
+def approval_backend() -> tuple[str, str, str]:
+    """``(base_url, workspace_slug, host_token)`` for the approval gate's own
+    front door — aw-backend's ``POST /api/workspaces/{slug}/approval/request``.
+
+    The gate used to POST straight at the Agents Platform's
+    ``/api/telegram/approval/request`` with **no credential at all**, which
+    meant the platform had nothing to route on and delivered every prompt to
+    whichever tenant its bootstrap default named — so a run gated inside one
+    workspace paged another workspace's admin. aw-backend already has the
+    right front door for this: the route is per-workspace in the URL and
+    guarded by ``require_workspace_actor``, which accepts exactly the
+    ``awlk_`` host credential this container is handed.
+
+    All three values come from the environment aw-workspace injects
+    (``AW_BACKEND_URL`` / ``AW_WORKSPACE_HOST_TOKEN`` via this app's manifest,
+    ``AW_WORKSPACE_SLUG`` unconditionally for every container app), each
+    overridable from ``config/gateway.json`` for a standalone deployment that
+    is not running inside an aw-workspace. Any of them empty makes the gate
+    fail closed — see ``ConfigGateway._await_approval``.
+    """
+    cfg = load_gateway_config()
+    base = (cfg.get("approval_backend_url")
+            or os.environ.get("AW_BACKEND_URL") or "").strip().rstrip("/")
+    slug = (cfg.get("approval_workspace_slug") or "").strip() or workspace_name()
+    token = (cfg.get("approval_backend_token")
+             or os.environ.get("AW_WORKSPACE_HOST_TOKEN") or "").strip()
+    return base, slug, token
 
 
 def link_tokens_path() -> str:

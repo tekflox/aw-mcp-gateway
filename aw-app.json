@@ -17,7 +17,9 @@
     "env": {
       "AW_APP_SCAN_ROOTS": "/opt/aw-workspace/apps",
       "AW_HOST_MCP_JSON": "/host-mcp.json",
-      "AW_MCP_GATEWAY_WARM_REDIS_URL": "${config.warm_redis_url}"
+      "AW_MCP_GATEWAY_WARM_REDIS_URL": "${config.warm_redis_url}",
+      "AW_BACKEND_URL": "${env.AW_BACKEND_URL}",
+      "AW_WORKSPACE_HOST_TOKEN": "${env.AW_WORKSPACE_HOST_TOKEN}"
     },
     "volumes": [
       {

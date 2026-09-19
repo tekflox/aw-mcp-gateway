@@ -9,11 +9,18 @@ import pytest
 from starlette.testclient import TestClient
 
 from gateway import config
+from gateway import config_gateway as cgw_mod
 from gateway.config_gateway import ConfigGateway, policy_upstreams
 from gateway.server import Gateway, build_app
 
 TOKEN = "test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+
+async def _no_sleep(_seconds):
+    """Collapse the approval gate's 2s poll interval so a test that exercises
+    the real ``_await_approval`` loop doesn't take five minutes to fail."""
+    return None
 
 
 class _FakeUpstream:
@@ -224,15 +231,140 @@ async def test_always_allow_exempts_a_slug_from_a_catch_all_approval(monkeypatch
     assert asked == ["agent 'coder-opus'"]
 
 
-async def test_approval_gate_fails_closed_without_a_platform_url():
+@pytest.mark.parametrize("missing", ["AW_BACKEND_URL",
+                                     "AW_WORKSPACE_SLUG",
+                                     "AW_WORKSPACE_HOST_TOKEN"])
+async def test_approval_gate_fails_closed_without_a_backend_credential(monkeypatch, missing):
+    """Each of the three is load-bearing on its own.
+
+    A gate that cannot authenticate must refuse the run, not fall back to an
+    unauthenticated POST — that fallback is exactly what sent every gated run
+    to one tenant's sysadmin regardless of which workspace it came from.
+
+    Asserted as "no request was attempted", not merely "the run was refused":
+    with a missing slug or token the URL is still dial-able and the refusal
+    would come from the connection failing, which is indistinguishable from
+    the gate having never noticed.
+    """
+    for name, value in (("AW_BACKEND_URL", "http://awb.test"),
+                        ("AW_WORKSPACE_SLUG", "crispal"),
+                        ("AW_WORKSPACE_HOST_TOKEN", "awlk_x_y")):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv(missing)
+
+    attempted: list[str] = []
+
+    class _RecordingClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            attempted.append(url)
+            raise AssertionError(f"the gate dialled {url} with no credential")
+        async def get(self, url, headers=None):
+            attempted.append(url)
+            raise AssertionError(f"the gate dialled {url} with no credential")
+
+    monkeypatch.setattr(cgw_mod.httpx, "AsyncClient", _RecordingClient)
+
     gw = _gateway({"agents-platform-runners": ["run_agent_async"]})
-    cgw = ConfigGateway(gw, {"upstreams": ["agents-platform-runners"],
-                             "run_agents_approval": ["*"]},
-                        name="p", agents_base="", upstream_roles=policy_upstreams())
+    cgw = _cgw(gw, {"upstreams": ["agents-platform-runners"],
+                    "run_agents_approval": ["*"]})
 
     reply = await _call(cgw, "run_agent_async", {"slug": "coder-opus"})
 
     assert "was not approved" in reply["error"]["message"]
+    assert attempted == []
+    assert gw.upstreams["agents-platform-runners"].calls == []
+
+
+async def test_approval_request_goes_to_this_workspaces_own_backend_front_door(monkeypatch):
+    """The whole point of the re-point: WHICH workspace is asking is in the
+    URL and proved by the host token, instead of being absent (and therefore
+    defaulted to the platform's bootstrap tenant) as it was when this posted
+    at agents-platform's ``/api/telegram/approval/request``.
+    """
+    monkeypatch.setenv("AW_BACKEND_URL", "http://awb.test/")
+    monkeypatch.setenv("AW_WORKSPACE_SLUG", "crispal")
+    monkeypatch.setenv("AW_WORKSPACE_HOST_TOKEN", "awlk_abc_def")
+
+    posts: list[tuple[str, dict, dict]] = []
+    gets: list[tuple[str, dict]] = []
+
+    class _FakeResponse:
+        def __init__(self, payload): self._payload, self.status_code = payload, 200
+        def json(self): return self._payload
+
+    class _FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+        async def post(self, url, json=None, headers=None):
+            posts.append((url, json or {}, headers or {}))
+            return _FakeResponse({"request_id": "req-1"})
+
+        async def get(self, url, headers=None):
+            gets.append((url, headers or {}))
+            return _FakeResponse({"status": "approved"})
+
+    monkeypatch.setattr(cgw_mod.httpx, "AsyncClient", _FakeClient)
+    monkeypatch.setattr(cgw_mod.asyncio, "sleep", _no_sleep)
+
+    gw = _gateway({"agents-platform-runners": ["run_agent_async"]})
+    cgw = _cgw(gw, {"upstreams": ["agents-platform-runners"],
+                    "run_agents_approval": ["*"]})
+
+    reply = await _call(cgw, "run_agent_async", {"slug": "coder-opus"})
+    assert "error" not in reply
+
+    url, body, headers = posts[0]
+    assert url == "http://awb.test/api/workspaces/crispal/approval/request"
+    assert headers["Authorization"] == "Bearer awlk_abc_def"
+    assert body["request_type"] == "agent_run"
+    assert body["secret_name"] == "agent 'coder-opus'"
+    # The poll is scoped and authenticated the same way — an unauthenticated
+    # GET would 401 forever and the gate would time out on an approved run.
+    assert gets[0] == ("http://awb.test/api/workspaces/crispal/approval/status/req-1",
+                       {"Authorization": "Bearer awlk_abc_def"})
+
+
+@pytest.mark.parametrize("status", ["denied", "expired", "not_found", "error"])
+async def test_a_terminal_poll_status_refuses_immediately(monkeypatch, status):
+    """``not_found``/``error`` are aw-backend answers the old AP route never
+    gave. Polling them for the full five minutes would hold an agent's call
+    open for a verdict that is never coming."""
+    monkeypatch.setenv("AW_BACKEND_URL", "http://awb.test")
+    monkeypatch.setenv("AW_WORKSPACE_SLUG", "crispal")
+    monkeypatch.setenv("AW_WORKSPACE_HOST_TOKEN", "awlk_abc_def")
+
+    polls: list[str] = []
+
+    class _FakeResponse:
+        def __init__(self, payload): self._payload, self.status_code = payload, 200
+        def json(self): return self._payload
+
+    class _FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            return _FakeResponse({"request_id": "req-1"})
+        async def get(self, url, headers=None):
+            polls.append(url)
+            return _FakeResponse({"status": status})
+
+    monkeypatch.setattr(cgw_mod.httpx, "AsyncClient", _FakeClient)
+    monkeypatch.setattr(cgw_mod.asyncio, "sleep", _no_sleep)
+
+    gw = _gateway({"agents-platform-runners": ["run_agent_async"]})
+    cgw = _cgw(gw, {"upstreams": ["agents-platform-runners"],
+                    "run_agents_approval": ["*"]})
+
+    reply = await _call(cgw, "run_agent_async", {"slug": "coder-opus"})
+
+    assert "was not approved" in reply["error"]["message"]
+    assert len(polls) == 1
 
 
 # ── Namespace injection ─────────────────────────────────────────────────────

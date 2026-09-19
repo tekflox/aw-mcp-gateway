@@ -30,9 +30,10 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import logging
-import os
 
 import httpx
+
+from . import config
 
 log = logging.getLogger("aw-mcp-gateway")
 
@@ -109,6 +110,11 @@ class ConfigGateway:
         self._spec = spec
         self._allowed = set(spec.get("upstreams") or [])
         self._roles = upstream_roles or policy_upstreams()
+        # Informational only since the approval gate moved to aw-backend
+        # (see _await_approval): it is the address of the agents-platform
+        # upstream this profile routes run-tools to, reported on
+        # ``GET /admin/configs`` so an operator can see which platform a
+        # profile is actually wired to. Nothing in this class dials it.
         self._agents_base = agents_base
 
         # Optional profile-wide tool ACL. Patterns may target the stripped
@@ -267,28 +273,39 @@ class ConfigGateway:
                 hits.append(f"{kind} '{slug}'")
         return ", ".join(hits) if hits else None
 
-    def _approval_base(self) -> str:
-        """Base URL of the Agents Platform that owns the Telegram approval
-        flow. Prefers the explicit ``agents_base`` this instance was built
-        with (derived by the server from the agents-platform upstream's own
-        ``env.AGENTS_BASE`` — so it is whatever that upstream already talks
-        to, with nothing extra to configure), then ``$AGENTS_BASE``."""
-        return (self._agents_base or os.environ.get("AGENTS_BASE") or "").rstrip("/")
-
     async def _await_approval(self, resource: str, reason: str) -> bool:
-        """POST an ``agent_run`` approval request to the Agents Platform and
-        block until it is approved. Fail-closed: any error, denial, timeout —
-        or no reachable platform at all — returns False."""
-        base = self._approval_base()
-        if not base:
-            log.error("approval gate: no agents-platform base URL — refusing %s", resource)
+        """POST an ``agent_run`` approval request to aw-backend and block until
+        it is approved. Fail-closed: any error, denial, timeout — or no
+        reachable backend at all — returns False.
+
+        This used to go straight at the Agents Platform's
+        ``/api/telegram/approval/request`` **unauthenticated**. That route had
+        no way to tell which workspace was asking, so it fell back to the
+        platform's bootstrap tenant and every gated run — in any workspace —
+        paged that one tenant's sysadmin. It was retired; the replacement is
+        aw-backend's ``POST /api/workspaces/{slug}/approval/request``, where
+        the workspace is in the URL and proved by the ``awlk_`` host
+        credential this container already holds. aw-backend then asks the
+        platform to deliver the prompt as that workspace's owner, and routing
+        follows the identity instead of a default.
+        """
+        base, slug, token = config.approval_backend()
+        if not (base and slug and token):
+            missing = ", ".join(n for n, v in (("AW_BACKEND_URL", base),
+                                               ("AW_WORKSPACE_SLUG", slug),
+                                               ("AW_WORKSPACE_HOST_TOKEN", token)) if not v)
+            log.error("approval gate: cannot reach aw-backend (missing %s) — refusing %s",
+                      missing, resource)
             return False
+        url = f"{base}/api/workspaces/{slug}/approval/request"
+        headers = {"Authorization": f"Bearer {token}"}
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 r = await client.post(
-                    f"{base}/api/telegram/approval/request",
+                    url,
                     json={"secret_name": resource, "reason": reason,
                           "request_type": "agent_run"},
+                    headers=headers,
                 )
                 if r.status_code != 200:
                     log.warning("approval gate: request failed %s: %s",
@@ -297,17 +314,22 @@ class ConfigGateway:
                 rid = (r.json() or {}).get("request_id")
                 if not rid:
                     return False
-                log.info("approval gate: request_id=%s resource=%s profile=%s",
-                         rid, resource, self._name)
+                log.info("approval gate: request_id=%s resource=%s profile=%s workspace=%s",
+                         rid, resource, self._name, slug)
+                status_url = f"{base}/api/workspaces/{slug}/approval/status/{rid}"
                 for _ in range(_APPROVAL_POLL_ATTEMPTS):
                     await asyncio.sleep(_APPROVAL_POLL_INTERVAL_S)
-                    s = await client.get(f"{base}/api/telegram/approval/status/{rid}")
+                    s = await client.get(status_url, headers=headers)
                     if s.status_code != 200:
                         continue
                     status = (s.json() or {}).get("status")
                     if status == "approved":
                         return True
-                    if status in ("denied", "expired"):
+                    # ``not_found`` is aw-backend's answer for a row this
+                    # workspace cannot see — including one it just wrote and
+                    # lost. Treated as terminal rather than polled for five
+                    # minutes: it will never become approved.
+                    if status in ("denied", "expired", "not_found", "error"):
                         return False
                 return False
         except Exception:
