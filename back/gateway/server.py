@@ -658,9 +658,17 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
         contributes.mcp: true saves its config: that app rewrites its own
         mcp.json to disk FIRST, then aw-workspace calls this directly on
         the container's internal address (no public hairpin through this
-        app's own reverse-proxy route)."""
+        app's own reverse-proxy route).
+
+        Also re-derives the scanned half of the named-config set (an app's
+        ``gateway-profiles.json``) so a profile an app just installed/updated
+        goes live here too — without this, a scanned profile only takes
+        effect on the next container restart, same failure shape reload()
+        itself exists to avoid for upstreams."""
         _check_admin_auth(authorization, workspace_identity)
-        return await gateway.reload()
+        result = await gateway.reload()
+        configs.replace(config.effective_named_configs())
+        return result
 
     @app.post("/link-tokens")
     async def mint_link_token(request: Request, authorization: str | None = Header(default=None)):
@@ -783,7 +791,7 @@ def main() -> None:
 
     tok = config.token()
     gateway = Gateway(allow)
-    app = build_app(gateway, tok, config.named_configs(), port=args.port)
+    app = build_app(gateway, tok, config.effective_named_configs(), port=args.port)
 
     log.info("AW MCP Gateway (standalone) on http://%s:%d/mcp (+ ws /link)", args.host, args.port)
     log.info("local upstream allowlist: %s", ", ".join(allow) or "—")

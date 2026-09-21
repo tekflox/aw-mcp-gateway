@@ -268,6 +268,73 @@ def save_named_configs(configs: dict) -> dict:
     return clean
 
 
+def scan_app_gateway_profiles(scan_roots: list[Path] | None = None) -> tuple[dict, dict]:
+    """Read ``gateway-profiles.json`` (top-level key ``profiles``) from each
+    installed app folder — the profile-side mirror of
+    :func:`scan_app_mcp_servers`.
+
+    Returns ``(profiles, sources)``. Deliberately does NOT copy
+    ``scan_app_mcp_servers``'s "later app folder wins" rule: a same-named
+    profile contributed by two different app dirs is dropped from both,
+    with the collision recorded in ``sources``, rather than one app
+    silently overriding another's tool scope. Upstreams tolerate
+    override-by-order; a profile is a privilege boundary, so a silent
+    override there would be silent privilege widening. An invalid name
+    (``valid_config_name``) is dropped on its own — one app's malformed
+    manifest must not stop the gateway from starting.
+    """
+    contributions: dict[str, list[tuple[str, str, dict]]] = {}
+    invalid: dict[str, tuple[str, str]] = {}
+    for root in scan_roots or _scan_roots():
+        if not root.is_dir():
+            continue
+        for app_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+            profiles_path = app_dir / "gateway-profiles.json"
+            if not profiles_path.is_file():
+                continue
+            data = _read_json(str(profiles_path), {})
+            raw = data.get("profiles") if isinstance(data, dict) else None
+            if not isinstance(raw, dict):
+                continue
+            for name, spec in raw.items():
+                name = str(name)
+                if not valid_config_name(name):
+                    invalid.setdefault(name, (app_dir.name, str(profiles_path)))
+                    continue
+                contributions.setdefault(name, []).append(
+                    (app_dir.name, str(profiles_path), spec if isinstance(spec, dict) else {}))
+
+    profiles: dict = {}
+    sources: dict = {}
+    for name, contribs in contributions.items():
+        apps = sorted({app for app, _path, _spec in contribs})
+        if len(apps) > 1:
+            sources[name] = {
+                "source": "conflict",
+                "apps": apps,
+                "paths": [path for _app, path, _spec in contribs],
+            }
+            continue
+        app, path, spec = contribs[0]
+        profiles[name] = normalize_config_spec(spec)
+        sources[name] = {"source": "scanned", "app": app, "path": path}
+    for name, (app, path) in invalid.items():
+        sources.setdefault(name, {"source": "invalid", "app": app, "path": path})
+    return profiles, sources
+
+
+def effective_named_configs() -> dict:
+    """Named configs an app contributed via ``gateway-profiles.json``, with
+    ``config/gateway.json``'s hand-authored ``configs`` layered on top BY
+    NAME — same polarity as :func:`effective_mcp_config` (``mcp.custom.json``
+    beats the scan). A human editing the profile editor always wins over
+    whatever an app declared for that same name."""
+    scanned, _sources = scan_app_gateway_profiles()
+    merged = dict(scanned)
+    merged.update(named_configs())
+    return merged
+
+
 def policy_upstream_overrides() -> dict:
     """``config/gateway.json``'s ``policy_upstreams`` block — which upstream
     names count as the agents-platform / knowledge-base / presentation roles

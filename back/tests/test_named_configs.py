@@ -17,6 +17,11 @@ TOKEN = "test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
+def _write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
+
+
 async def _no_sleep(_seconds):
     """Collapse the approval gate's 2s poll interval so a test that exercises
     the real ``_await_approval`` loop doesn't take five minutes to fail."""
@@ -466,6 +471,69 @@ def test_admin_configs_roundtrip_applies_without_a_restart(tmp_path, monkeypatch
     assert client.post("/mcp/crispal", headers=AUTH,
                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
                        ).status_code == 404
+
+
+def test_scanned_profile_is_reachable_at_mcp_name(tmp_path, monkeypatch):
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"crispal": {"upstreams": ["aw-crispal"]}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+
+    gw = _gateway({"aw-crispal": ["get_site_info"]})
+    client = TestClient(build_app(gw, TOKEN, config.effective_named_configs(), port=9200))
+
+    listed = client.post("/mcp/crispal", headers=AUTH,
+                         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert [t["name"] for t in listed.json()["result"]["tools"]] == ["get_site_info"]
+
+
+def test_reload_applies_a_newly_scanned_profile_without_a_restart(tmp_path, monkeypatch):
+    """PLAN.md risk 4: POST /reload must re-derive the scanned half of the
+    named-config set too, not just upstreams — a profile an app just wrote
+    to disk must go live on the next /reload, exactly like an upstream does.
+    Deliberately does NOT rebuild the app/client (which would be equivalent
+    to a restart and would pass even if the /reload handler never touched
+    NamedConfigs at all) — the profile file is written AFTER the app is
+    already built and serving, then only /reload is called.
+    """
+    apps = tmp_path / "apps"
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(tmp_path / "mcp.custom.json"))
+    monkeypatch.setattr(config, "HOST_MCP_JSON", "")
+
+    gw = _gateway({"aw-crispal": ["get_site_info"]})
+
+    async def _noop_reload():
+        # Gateway.reload() reconciles local upstreams against config/mcp.json,
+        # which this test never populates (the fake upstream above is wired
+        # in directly) — stubbed out so the assertion stays isolated to the
+        # NamedConfigs re-derivation this test actually targets.
+        return {"added": [], "removed": [], "changed": [], "unchanged": [],
+                "failed": [], "parked": [], "upstreams": [], "tools": 0}
+    monkeypatch.setattr(gw, "reload", _noop_reload)
+
+    client = TestClient(build_app(gw, TOKEN, {}, port=9200))  # boots with NO profiles
+
+    assert client.post("/mcp/crispal", headers=AUTH,
+                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                       ).status_code == 404
+
+    # The profile file appears on disk only now — after the app already booted.
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"crispal": {"upstreams": ["aw-crispal"]}}
+    })
+
+    res = client.post("/reload", headers=AUTH)
+    assert res.status_code == 200
+
+    listed = client.post("/mcp/crispal", headers=AUTH,
+                         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert [t["name"] for t in listed.json()["result"]["tools"]] == ["get_site_info"]
+    assert client.get("/healthz").json()["configs"] == ["crispal"]
 
 
 def test_admin_configs_requires_auth(tmp_path, monkeypatch):
