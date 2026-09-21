@@ -43,6 +43,25 @@ DEFAULT_PROTOCOL = "2024-11-05"
 #: stdio just never got the same treatment.
 HANDSHAKE_TIMEOUT_SECONDS = 30.0
 
+#: httpx.AsyncClient(timeout=30.0) used to apply that single scalar to
+#: connect/read/write/pool alike for EVERY call an HttpUpstream makes,
+#: including tools/call. That's fine for a typical tool, but several real
+#: upstream tools legitimately block far longer than 30s waiting on a human
+#: Telegram approval tap — confirmed live for aw-crispal's backup_database
+#: (blocks on up to two Approve/Deny taps, a 300s SSH-key-vault approval
+#: poll, and a 900s backup subprocess). The gateway's own read timeout fired
+#: first every time, call_tool() classified it as an unproven "timeout" (see
+#: _classify_call_failure) and told the caller the result was UNCERTAIN —
+#: while the real handler kept running orphaned server-side, still writing
+#: to disk minutes after the gateway had already given up on it.
+#:
+#: Connect/write/pool stay short so a genuinely dead/unreachable upstream
+#: still fails fast; only read gets a generous budget for the slow-but-
+#: eventually-successful case. Same shape as agents-platform-multitenant's
+#: test_telegram_upload_download_retry.py fix for an analogous scalar-
+#: timeout bug on a Telegram download leg.
+UPSTREAM_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
+
 #: Correlation ids owned by THIS gateway process, for the transports that
 #: multiplex many concurrent callers over ONE shared connection (the stdio
 #: ``Upstream`` child, the ``/link`` ``RemoteUpstream`` WebSocket).
@@ -395,7 +414,7 @@ class HttpUpstream:
         # redirect as an HTTPStatusError, not a success, so start() would
         # raise and the upstream would be dropped with 0 tools instead of
         # transparently following the hop like a browser would.
-        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        self._client = httpx.AsyncClient(timeout=UPSTREAM_HTTP_TIMEOUT, follow_redirects=True)
         init = await self._initialize_with_connect_retry()
         log.info("http upstream %s initialized: %s", self.name,
                  init.get("result", {}).get("serverInfo", {}).get("name", "?"))
@@ -526,8 +545,13 @@ class GatewayUpstream(HttpUpstream):
     async def start(self) -> None:
         # Same reasoning as HttpUpstream.start(): don't let an unfollowed
         # redirect on /healthz or the handshake sink an otherwise-reachable
-        # federated gateway.
-        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        # federated gateway. This client also carries every proxied
+        # call_tool() (inherited, unmodified) for this remote gateway, so it
+        # needs the same generous read budget HttpUpstream gets — an
+        # approval-gated tool one hop further into a federated gateway hits
+        # the identical 30s-read problem otherwise. Connect stays short,
+        # which still covers "the remote gateway never starts".
+        self._client = httpx.AsyncClient(timeout=UPSTREAM_HTTP_TIMEOUT, follow_redirects=True)
         resp = await self._client.get(_healthz_url(self.url), headers=self._extra_headers)
         resp.raise_for_status()
         health = resp.json()
