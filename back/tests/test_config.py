@@ -152,7 +152,7 @@ def test_effective_named_configs_lets_gateway_json_win_over_scanned(tmp_path, mo
     monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
     monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
 
-    effective = config.effective_named_configs()
+    effective, _sources = config.effective_named_configs()
 
     assert effective["crispal-full"] == {"upstreams": ["kb"]}
 
@@ -165,7 +165,7 @@ def test_effective_named_configs_includes_a_scanned_only_profile(tmp_path, monke
     monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
     monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
 
-    effective = config.effective_named_configs()
+    effective, _sources = config.effective_named_configs()
 
     assert effective["crispal-full"] == {"upstreams": ["aw-crispal"]}
 

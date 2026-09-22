@@ -482,7 +482,9 @@ def test_scanned_profile_is_reachable_at_mcp_name(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
 
     gw = _gateway({"aw-crispal": ["get_site_info"]})
-    client = TestClient(build_app(gw, TOKEN, config.effective_named_configs(), port=9200))
+    named_configs, config_sources = config.effective_named_configs()
+    client = TestClient(build_app(gw, TOKEN, named_configs, port=9200,
+                                  config_sources=config_sources))
 
     listed = client.post("/mcp/crispal", headers=AUTH,
                          json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
@@ -534,6 +536,102 @@ def test_reload_applies_a_newly_scanned_profile_without_a_restart(tmp_path, monk
                          json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert [t["name"] for t in listed.json()["result"]["tools"]] == ["get_site_info"]
     assert client.get("/healthz").json()["configs"] == ["crispal"]
+
+
+def test_healthz_reports_dropped_profiles_without_paths(tmp_path, monkeypatch):
+    """PLAN.md §6-bis: scan_app_gateway_profiles computes ``sources`` with
+    ``conflict``/``invalid`` entries and effective_named_configs threw it
+    away — dead_profiles (aw-workspace's doctor) only catches a dropped
+    profile once something already references its name; a declared, dropped,
+    not-yet-referenced profile was invisible on both sides. /healthz is
+    unauthenticated, so paths are deliberately left out — only name/reason/
+    apps, same public-ness as the ``configs`` list already there."""
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"shared": {"upstreams": ["aw-crispal"]}}
+    })
+    _write_json(apps / "app-b" / "gateway-profiles.json", {
+        "profiles": {"shared": {"upstreams": ["kb"]},
+                     "bad/name": {"upstreams": ["kb"]}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+
+    named_configs, config_sources = config.effective_named_configs()
+    client = TestClient(build_app(_gateway({}), TOKEN, named_configs, port=9200,
+                                  config_sources=config_sources))
+
+    body = client.get("/healthz").json()
+    dropped = {d["name"]: d for d in body["dropped_profiles"]}
+
+    assert dropped["shared"] == {"name": "shared", "reason": "conflict",
+                                  "apps": ["app-a", "app-b"]}
+    assert dropped["bad/name"] == {"name": "bad/name", "reason": "invalid",
+                                    "apps": ["app-b"]}
+    assert "shared" not in body["configs"]
+    assert "bad/name" not in body["configs"]
+
+
+def test_admin_configs_reports_sources_with_paths(tmp_path, monkeypatch):
+    """The authenticated counterpart of the /healthz test above: an operator
+    needs the actual file to go fix, so /admin/configs carries the full
+    scan_app_gateway_profiles sources, paths included."""
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"shared": {"upstreams": ["aw-crispal"]}}
+    })
+    _write_json(apps / "app-b" / "gateway-profiles.json", {
+        "profiles": {"shared": {"upstreams": ["kb"]}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+
+    named_configs, config_sources = config.effective_named_configs()
+    client = TestClient(build_app(_gateway({}), TOKEN, named_configs, port=9200,
+                                  config_sources=config_sources))
+
+    res = client.get("/admin/configs", headers=AUTH)
+    assert res.status_code == 200
+    sources = res.json()["sources"]
+    assert sources["shared"]["source"] == "conflict"
+    assert sources["shared"]["apps"] == ["app-a", "app-b"]
+    assert all(p.endswith("gateway-profiles.json") for p in sources["shared"]["paths"])
+
+
+def test_reload_rederives_agents_base_like_put_admin_configs_does(tmp_path, monkeypatch):
+    """PUT /admin/configs re-derives ``agents_base`` after applying a config
+    change (server.py, next to the ``configs.replace`` call) because a
+    config can start naming agents-platform for the first time and the
+    approval gate needs a base URL right away. /reload didn't replicate that
+    line — QA flagged it on the PR-2 review as non-blocking but cheap to
+    close for symmetry. Deliberately drives it through /reload, not a
+    rebuild, so it would fail if the line were ever dropped again."""
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "gateway.json"))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(tmp_path / "mcp.custom.json"))
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(tmp_path / "apps"))
+    monkeypatch.setattr(config, "HOST_MCP_JSON", "")
+    monkeypatch.delenv("AGENTS_BASE", raising=False)
+
+    gw = _gateway({})
+
+    async def _noop_reload():
+        return {"added": [], "removed": [], "changed": [], "unchanged": [],
+                "failed": [], "parked": [], "upstreams": [], "tools": 0}
+    monkeypatch.setattr(gw, "reload", _noop_reload)
+
+    client = TestClient(build_app(gw, TOKEN, {}, port=9200))
+    assert client.get("/admin/configs", headers=AUTH).json()["agents_base"] == ""
+
+    # agents-platform-runners' own env appears only now — after boot.
+    (tmp_path / "mcp.json").write_text(json.dumps({"mcpServers": {
+        "agents-platform-runners": {"command": "python3",
+                                     "env": {"AGENTS_BASE": "http://172.18.0.1:10014"}},
+    }}))
+
+    assert client.post("/reload", headers=AUTH).status_code == 200
+    assert (client.get("/admin/configs", headers=AUTH).json()["agents_base"]
+            == "http://172.18.0.1:10014")
 
 
 def test_admin_configs_requires_auth(tmp_path, monkeypatch):

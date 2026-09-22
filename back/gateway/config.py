@@ -323,16 +323,21 @@ def scan_app_gateway_profiles(scan_roots: list[Path] | None = None) -> tuple[dic
     return profiles, sources
 
 
-def effective_named_configs() -> dict:
+def effective_named_configs() -> tuple[dict, dict]:
     """Named configs an app contributed via ``gateway-profiles.json``, with
     ``config/gateway.json``'s hand-authored ``configs`` layered on top BY
     NAME — same polarity as :func:`effective_mcp_config` (``mcp.custom.json``
     beats the scan). A human editing the profile editor always wins over
-    whatever an app declared for that same name."""
-    scanned, _sources = scan_app_gateway_profiles()
+    whatever an app declared for that same name.
+
+    Returns ``(configs, sources)`` — ``sources`` is
+    :func:`scan_app_gateway_profiles`'s per-name provenance (``scanned``/
+    ``conflict``/``invalid``), passed through so a caller can surface a
+    profile that got silently dropped without a second disk scan."""
+    scanned, sources = scan_app_gateway_profiles()
     merged = dict(scanned)
     merged.update(named_configs())
-    return merged
+    return merged, sources
 
 
 def policy_upstream_overrides() -> dict:
