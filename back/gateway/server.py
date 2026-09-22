@@ -778,10 +778,17 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
         if incoming is None:
             incoming = body
         try:
-            saved = config.save_named_configs(incoming)
+            config.save_named_configs(incoming)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        configs.replace(saved)
+        # Re-derive rather than replace-by-the-saved-layer-alone: the live set
+        # is scanned ⊕ gateway.json (see effective_named_configs), and save()
+        # only just persisted the gateway.json half. Re-deriving picks that
+        # fresh write back up next to the scanned profiles, instead of
+        # dropping every app-contributed profile until the next /reload —
+        # the same invariant /reload itself already maintains.
+        merged, sources = config.effective_named_configs()
+        configs.replace(merged, sources=sources)
         # Re-derive here too: a config can start naming agents-platform for the
         # first time, and the approval gate needs a base URL for it right away.
         configs.agents_base = config.agents_base()

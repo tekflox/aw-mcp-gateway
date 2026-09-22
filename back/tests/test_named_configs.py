@@ -473,6 +473,64 @@ def test_admin_configs_roundtrip_applies_without_a_restart(tmp_path, monkeypatch
                        ).status_code == 404
 
 
+def test_put_admin_configs_does_not_drop_a_scanned_app_profile(tmp_path, monkeypatch):
+    """Before PR-2 the live set WAS gateway.json's ``configs`` layer, so
+    ``configs.replace(saved)`` (``saved`` = ``save_named_configs``'s return,
+    only that layer) was exact. PR-2 made the live set scanned ⊕
+    gateway.json, and this line was never updated to match — so a PUT that
+    doesn't mention a scanned profile (the profile editor never lists app
+    contributions) evicts it from the live set until the next /reload or
+    restart. Concretely: app A declares 'crispal' via gateway-profiles.json;
+    gateway.json already holds the unrelated human profile 'other'; the
+    editor PUTs just 'other' back; 'crispal' must still answer at
+    /mcp/crispal with no /reload in between."""
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"crispal": {"upstreams": ["aw-crispal"]}}
+    })
+    _write_json(tmp_path / "gateway.json", {
+        "token": TOKEN,
+        "configs": {"other": {"upstreams": ["kb"]}},
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "gateway.json"))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(tmp_path / "mcp.custom.json"))
+    monkeypatch.setattr(config, "HOST_MCP_JSON", "")
+
+    gw = _gateway({"aw-crispal": ["get_site_info"], "kb": ["search_knowledge_base"]})
+    named_configs, config_sources = config.effective_named_configs()
+    client = TestClient(build_app(gw, TOKEN, named_configs, port=9200,
+                                  config_sources=config_sources))
+
+    # Both live at boot: one scanned, one hand-authored.
+    assert client.post("/mcp/crispal", headers=AUTH,
+                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                       ).status_code == 200
+    assert client.post("/mcp/other", headers=AUTH,
+                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                       ).status_code == 200
+
+    # The editor saves 'other' back unchanged, never mentioning 'crispal' —
+    # it was never in gateway.json's own set to begin with.
+    res = client.put("/admin/configs", headers=AUTH,
+                     json={"configs": {"other": {"upstreams": ["kb"]}}})
+    assert res.status_code == 200
+
+    listed = client.post("/mcp/crispal", headers=AUTH,
+                         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert listed.status_code == 200, (
+        "scanned profile 'crispal' was evicted by a PUT that never mentioned it")
+    assert [t["name"] for t in listed.json()["result"]["tools"]] == ["get_site_info"]
+
+    # Inverse guarantee, already correct: a PUT that omits a *human-authored*
+    # profile removes it — save() is the authority over the gateway.json layer.
+    client.put("/admin/configs", headers=AUTH, json={"configs": {}})
+    assert client.post("/mcp/other", headers=AUTH,
+                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                       ).status_code == 404
+
+
 def test_scanned_profile_is_reachable_at_mcp_name(tmp_path, monkeypatch):
     apps = tmp_path / "apps"
     _write_json(apps / "app-a" / "gateway-profiles.json", {
