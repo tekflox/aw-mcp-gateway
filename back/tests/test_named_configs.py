@@ -17,6 +17,11 @@ TOKEN = "test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
+def _write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
+
+
 async def _no_sleep(_seconds):
     """Collapse the approval gate's 2s poll interval so a test that exercises
     the real ``_await_approval`` loop doesn't take five minutes to fail."""
@@ -466,6 +471,225 @@ def test_admin_configs_roundtrip_applies_without_a_restart(tmp_path, monkeypatch
     assert client.post("/mcp/crispal", headers=AUTH,
                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
                        ).status_code == 404
+
+
+def test_put_admin_configs_does_not_drop_a_scanned_app_profile(tmp_path, monkeypatch):
+    """Before PR-2 the live set WAS gateway.json's ``configs`` layer, so
+    ``configs.replace(saved)`` (``saved`` = ``save_named_configs``'s return,
+    only that layer) was exact. PR-2 made the live set scanned ⊕
+    gateway.json, and this line was never updated to match — so a PUT that
+    doesn't mention a scanned profile (the profile editor never lists app
+    contributions) evicts it from the live set until the next /reload or
+    restart. Concretely: app A declares 'crispal' via gateway-profiles.json;
+    gateway.json already holds the unrelated human profile 'other'; the
+    editor PUTs just 'other' back; 'crispal' must still answer at
+    /mcp/crispal with no /reload in between."""
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"crispal": {"upstreams": ["aw-crispal"]}}
+    })
+    _write_json(tmp_path / "gateway.json", {
+        "token": TOKEN,
+        "configs": {"other": {"upstreams": ["kb"]}},
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "gateway.json"))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(tmp_path / "mcp.custom.json"))
+    monkeypatch.setattr(config, "HOST_MCP_JSON", "")
+
+    gw = _gateway({"aw-crispal": ["get_site_info"], "kb": ["search_knowledge_base"]})
+    named_configs, config_sources = config.effective_named_configs()
+    client = TestClient(build_app(gw, TOKEN, named_configs, port=9200,
+                                  config_sources=config_sources))
+
+    # Both live at boot: one scanned, one hand-authored.
+    assert client.post("/mcp/crispal", headers=AUTH,
+                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                       ).status_code == 200
+    assert client.post("/mcp/other", headers=AUTH,
+                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                       ).status_code == 200
+
+    # The editor saves 'other' back unchanged, never mentioning 'crispal' —
+    # it was never in gateway.json's own set to begin with.
+    res = client.put("/admin/configs", headers=AUTH,
+                     json={"configs": {"other": {"upstreams": ["kb"]}}})
+    assert res.status_code == 200
+
+    listed = client.post("/mcp/crispal", headers=AUTH,
+                         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert listed.status_code == 200, (
+        "scanned profile 'crispal' was evicted by a PUT that never mentioned it")
+    assert [t["name"] for t in listed.json()["result"]["tools"]] == ["get_site_info"]
+
+    # Inverse guarantee, already correct: a PUT that omits a *human-authored*
+    # profile removes it — save() is the authority over the gateway.json layer.
+    client.put("/admin/configs", headers=AUTH, json={"configs": {}})
+    assert client.post("/mcp/other", headers=AUTH,
+                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                       ).status_code == 404
+
+
+def test_scanned_profile_is_reachable_at_mcp_name(tmp_path, monkeypatch):
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"crispal": {"upstreams": ["aw-crispal"]}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+
+    gw = _gateway({"aw-crispal": ["get_site_info"]})
+    named_configs, config_sources = config.effective_named_configs()
+    client = TestClient(build_app(gw, TOKEN, named_configs, port=9200,
+                                  config_sources=config_sources))
+
+    listed = client.post("/mcp/crispal", headers=AUTH,
+                         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert [t["name"] for t in listed.json()["result"]["tools"]] == ["get_site_info"]
+
+
+def test_reload_applies_a_newly_scanned_profile_without_a_restart(tmp_path, monkeypatch):
+    """PLAN.md risk 4: POST /reload must re-derive the scanned half of the
+    named-config set too, not just upstreams — a profile an app just wrote
+    to disk must go live on the next /reload, exactly like an upstream does.
+    Deliberately does NOT rebuild the app/client (which would be equivalent
+    to a restart and would pass even if the /reload handler never touched
+    NamedConfigs at all) — the profile file is written AFTER the app is
+    already built and serving, then only /reload is called.
+    """
+    apps = tmp_path / "apps"
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(tmp_path / "mcp.custom.json"))
+    monkeypatch.setattr(config, "HOST_MCP_JSON", "")
+
+    gw = _gateway({"aw-crispal": ["get_site_info"]})
+
+    async def _noop_reload():
+        # Gateway.reload() reconciles local upstreams against config/mcp.json,
+        # which this test never populates (the fake upstream above is wired
+        # in directly) — stubbed out so the assertion stays isolated to the
+        # NamedConfigs re-derivation this test actually targets.
+        return {"added": [], "removed": [], "changed": [], "unchanged": [],
+                "failed": [], "parked": [], "upstreams": [], "tools": 0}
+    monkeypatch.setattr(gw, "reload", _noop_reload)
+
+    client = TestClient(build_app(gw, TOKEN, {}, port=9200))  # boots with NO profiles
+
+    assert client.post("/mcp/crispal", headers=AUTH,
+                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                       ).status_code == 404
+
+    # The profile file appears on disk only now — after the app already booted.
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"crispal": {"upstreams": ["aw-crispal"]}}
+    })
+
+    res = client.post("/reload", headers=AUTH)
+    assert res.status_code == 200
+
+    listed = client.post("/mcp/crispal", headers=AUTH,
+                         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert [t["name"] for t in listed.json()["result"]["tools"]] == ["get_site_info"]
+    assert client.get("/healthz").json()["configs"] == ["crispal"]
+
+
+def test_healthz_reports_dropped_profiles_without_paths(tmp_path, monkeypatch):
+    """PLAN.md §6-bis: scan_app_gateway_profiles computes ``sources`` with
+    ``conflict``/``invalid`` entries and effective_named_configs threw it
+    away — dead_profiles (aw-workspace's doctor) only catches a dropped
+    profile once something already references its name; a declared, dropped,
+    not-yet-referenced profile was invisible on both sides. /healthz is
+    unauthenticated, so paths are deliberately left out — only name/reason/
+    apps, same public-ness as the ``configs`` list already there."""
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"shared": {"upstreams": ["aw-crispal"]}}
+    })
+    _write_json(apps / "app-b" / "gateway-profiles.json", {
+        "profiles": {"shared": {"upstreams": ["kb"]},
+                     "bad/name": {"upstreams": ["kb"]}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+
+    named_configs, config_sources = config.effective_named_configs()
+    client = TestClient(build_app(_gateway({}), TOKEN, named_configs, port=9200,
+                                  config_sources=config_sources))
+
+    body = client.get("/healthz").json()
+    dropped = {d["name"]: d for d in body["dropped_profiles"]}
+
+    assert dropped["shared"] == {"name": "shared", "reason": "conflict",
+                                  "apps": ["app-a", "app-b"]}
+    assert dropped["bad/name"] == {"name": "bad/name", "reason": "invalid",
+                                    "apps": ["app-b"]}
+    assert "shared" not in body["configs"]
+    assert "bad/name" not in body["configs"]
+
+
+def test_admin_configs_reports_sources_with_paths(tmp_path, monkeypatch):
+    """The authenticated counterpart of the /healthz test above: an operator
+    needs the actual file to go fix, so /admin/configs carries the full
+    scan_app_gateway_profiles sources, paths included."""
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"shared": {"upstreams": ["aw-crispal"]}}
+    })
+    _write_json(apps / "app-b" / "gateway-profiles.json", {
+        "profiles": {"shared": {"upstreams": ["kb"]}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+
+    named_configs, config_sources = config.effective_named_configs()
+    client = TestClient(build_app(_gateway({}), TOKEN, named_configs, port=9200,
+                                  config_sources=config_sources))
+
+    res = client.get("/admin/configs", headers=AUTH)
+    assert res.status_code == 200
+    sources = res.json()["sources"]
+    assert sources["shared"]["source"] == "conflict"
+    assert sources["shared"]["apps"] == ["app-a", "app-b"]
+    assert all(p.endswith("gateway-profiles.json") for p in sources["shared"]["paths"])
+
+
+def test_reload_rederives_agents_base_like_put_admin_configs_does(tmp_path, monkeypatch):
+    """PUT /admin/configs re-derives ``agents_base`` after applying a config
+    change (server.py, next to the ``configs.replace`` call) because a
+    config can start naming agents-platform for the first time and the
+    approval gate needs a base URL right away. /reload didn't replicate that
+    line — QA flagged it on the PR-2 review as non-blocking but cheap to
+    close for symmetry. Deliberately drives it through /reload, not a
+    rebuild, so it would fail if the line were ever dropped again."""
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "gateway.json"))
+    monkeypatch.setattr(config, "MCP_JSON", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(config, "MCP_CUSTOM_JSON", str(tmp_path / "mcp.custom.json"))
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(tmp_path / "apps"))
+    monkeypatch.setattr(config, "HOST_MCP_JSON", "")
+    monkeypatch.delenv("AGENTS_BASE", raising=False)
+
+    gw = _gateway({})
+
+    async def _noop_reload():
+        return {"added": [], "removed": [], "changed": [], "unchanged": [],
+                "failed": [], "parked": [], "upstreams": [], "tools": 0}
+    monkeypatch.setattr(gw, "reload", _noop_reload)
+
+    client = TestClient(build_app(gw, TOKEN, {}, port=9200))
+    assert client.get("/admin/configs", headers=AUTH).json()["agents_base"] == ""
+
+    # agents-platform-runners' own env appears only now — after boot.
+    (tmp_path / "mcp.json").write_text(json.dumps({"mcpServers": {
+        "agents-platform-runners": {"command": "python3",
+                                     "env": {"AGENTS_BASE": "http://172.18.0.1:10014"}},
+    }}))
+
+    assert client.post("/reload", headers=AUTH).status_code == 200
+    assert (client.get("/admin/configs", headers=AUTH).json()["agents_base"]
+            == "http://172.18.0.1:10014")
 
 
 def test_admin_configs_requires_auth(tmp_path, monkeypatch):

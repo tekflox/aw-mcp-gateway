@@ -475,16 +475,38 @@ class NamedConfigs:
     """
 
     def __init__(self, specs: dict | None = None, agents_base: str = "",
-                 upstream_roles: dict | None = None):
+                 upstream_roles: dict | None = None, sources: dict | None = None):
         self.specs: dict[str, dict] = dict(specs or {})
         self.agents_base = agents_base
         self.upstream_roles = upstream_roles or policy_upstreams()
+        # Per-name provenance from scan_app_gateway_profiles — scanned/
+        # conflict/invalid — kept so /healthz and /admin/configs can report
+        # a dropped profile without re-scanning disk on every request.
+        self.sources: dict = dict(sources or {})
 
     def names(self) -> list[str]:
         return sorted(self.specs)
 
-    def replace(self, specs: dict) -> None:
+    def replace(self, specs: dict, sources: dict | None = None) -> None:
         self.specs = dict(specs or {})
+        if sources is not None:
+            self.sources = dict(sources)
+
+    def dropped_profiles(self) -> list[dict]:
+        """Profiles scan_app_gateway_profiles dropped — name collision
+        between two apps, or an invalid name — as ``{name, reason, apps}``.
+        No ``path``: this backs /healthz, which is unauthenticated, and a
+        profile name is already public there (``configs``) while a
+        filesystem path is not."""
+        out = []
+        for name, info in sorted(self.sources.items()):
+            source = info.get("source")
+            if source == "conflict":
+                out.append({"name": name, "reason": "conflict", "apps": info.get("apps", [])})
+            elif source == "invalid":
+                app = info.get("app")
+                out.append({"name": name, "reason": "invalid", "apps": [app] if app else []})
+        return out
 
     def gateway_for(self, gateway: Gateway, name: str) -> ConfigGateway | None:
         spec = self.specs.get(name)
@@ -496,7 +518,8 @@ class NamedConfigs:
 
 
 def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
-              token_store: TokenStore | None = None, port: int = 9200) -> FastAPI:
+              token_store: TokenStore | None = None, port: int = 9200,
+              config_sources: dict | None = None) -> FastAPI:
     from contextlib import asynccontextmanager
 
     # Accepts the historical ``{name: [upstreams]}`` shape as well as the full
@@ -506,6 +529,7 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
          for name, spec in (named_configs or {}).items()},
         agents_base=config.agents_base(),
         upstream_roles=policy_upstreams(config.policy_upstream_overrides()),
+        sources=config_sources,
     )
     token_store = token_store or FileTokenStore(config.link_tokens_path())
 
@@ -570,6 +594,13 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
                 "remote_upstreams": list(gateway.remotes),
                 "tools": len(gateway.agg_tools),
                 "configs": configs.names(),
+                # A profile scan_app_gateway_profiles dropped — name
+                # collision between two apps, or an invalid name — before it
+                # was ever consumed. dead_profiles (aw-workspace's doctor)
+                # only catches a dropped profile once something references
+                # it by name; this is the same class of silent loss one step
+                # earlier, when nothing has referenced it yet.
+                "dropped_profiles": configs.dropped_profiles(),
                 "gateway_id": gateway.gateway_id,
                 # Which workspace this gateway belongs to. Unauthenticated on
                 # purpose, alongside gateway_id: the case a caller most needs
@@ -658,9 +689,23 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
         contributes.mcp: true saves its config: that app rewrites its own
         mcp.json to disk FIRST, then aw-workspace calls this directly on
         the container's internal address (no public hairpin through this
-        app's own reverse-proxy route)."""
+        app's own reverse-proxy route).
+
+        Also re-derives the scanned half of the named-config set (an app's
+        ``gateway-profiles.json``) so a profile an app just installed/updated
+        goes live here too — without this, a scanned profile only takes
+        effect on the next container restart, same failure shape reload()
+        itself exists to avoid for upstreams."""
         _check_admin_auth(authorization, workspace_identity)
-        return await gateway.reload()
+        result = await gateway.reload()
+        merged, sources = config.effective_named_configs()
+        configs.replace(merged, sources=sources)
+        # Re-derive here too, for the same reason put_named_configs() below
+        # does — a config can start naming agents-platform for the first
+        # time on a reload, not just on a manual save, and the approval gate
+        # needs a base URL for it right away.
+        configs.agents_base = config.agents_base()
+        return result
 
     @app.post("/link-tokens")
     async def mint_link_token(request: Request, authorization: str | None = Header(default=None)):
@@ -703,6 +748,10 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
             "policy_upstreams": {k: sorted(v) for k, v in configs.upstream_roles.items()},
             "agents_base": configs.agents_base,
             "endpoint_template": f"http://127.0.0.1:{port}/mcp/{{name}}",
+            # Full provenance (scanned/conflict/invalid), paths included —
+            # authenticated endpoint, so unlike /healthz's dropped_profiles
+            # it can say which file an operator needs to go fix.
+            "sources": configs.sources,
         }
 
     @app.get("/admin/configs")
@@ -729,10 +778,17 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
         if incoming is None:
             incoming = body
         try:
-            saved = config.save_named_configs(incoming)
+            config.save_named_configs(incoming)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        configs.replace(saved)
+        # Re-derive rather than replace-by-the-saved-layer-alone: the live set
+        # is scanned ⊕ gateway.json (see effective_named_configs), and save()
+        # only just persisted the gateway.json half. Re-deriving picks that
+        # fresh write back up next to the scanned profiles, instead of
+        # dropping every app-contributed profile until the next /reload —
+        # the same invariant /reload itself already maintains.
+        merged, sources = config.effective_named_configs()
+        configs.replace(merged, sources=sources)
         # Re-derive here too: a config can start naming agents-platform for the
         # first time, and the approval gate needs a base URL for it right away.
         configs.agents_base = config.agents_base()
@@ -783,7 +839,8 @@ def main() -> None:
 
     tok = config.token()
     gateway = Gateway(allow)
-    app = build_app(gateway, tok, config.named_configs(), port=args.port)
+    named_configs, config_sources = config.effective_named_configs()
+    app = build_app(gateway, tok, named_configs, config_sources=config_sources, port=args.port)
 
     log.info("AW MCP Gateway (standalone) on http://%s:%d/mcp (+ ws /link)", args.host, args.port)
     log.info("local upstream allowlist: %s", ", ".join(allow) or "—")

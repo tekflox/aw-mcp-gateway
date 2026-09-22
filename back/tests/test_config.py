@@ -91,6 +91,85 @@ def test_cwd_app_dir_flag_does_not_override_explicit_cwd(tmp_path, monkeypatch):
     assert "cwd_app_dir" not in servers["srv"]
 
 
+def test_scan_app_gateway_profiles_reads_profiles_key(tmp_path, monkeypatch):
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"crispal-full": {"upstreams": ["aw-crispal"], "kb_index": "crispal"}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+
+    profiles, sources = config.scan_app_gateway_profiles()
+
+    assert profiles["crispal-full"] == {"upstreams": ["aw-crispal"], "kb_index": "crispal"}
+    assert sources["crispal-full"] == {
+        "source": "scanned", "app": "app-a",
+        "path": str(apps / "app-a" / "gateway-profiles.json"),
+    }
+
+
+def test_scan_app_gateway_profiles_drops_both_sides_of_a_name_collision(tmp_path, monkeypatch):
+    """Deliberate divergence from scan_app_mcp_servers's last-writer-wins:
+    a profile is a scope grant, so two apps declaring the same name is
+    silent privilege widening, not a harmless override — see PLAN.md §2.1."""
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"shared": {"upstreams": ["aw-crispal"]}}
+    })
+    _write_json(apps / "app-b" / "gateway-profiles.json", {
+        "profiles": {"shared": {"upstreams": ["kb"]}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+
+    profiles, sources = config.scan_app_gateway_profiles()
+
+    assert "shared" not in profiles
+    assert sources["shared"]["source"] == "conflict"
+    assert sources["shared"]["apps"] == ["app-a", "app-b"]
+
+
+def test_scan_app_gateway_profiles_drops_an_invalid_name_without_crashing(tmp_path, monkeypatch):
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"bad/name": {"upstreams": ["aw-crispal"]},
+                     "good-name": {"upstreams": ["aw-crispal"]}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+
+    profiles, sources = config.scan_app_gateway_profiles()
+
+    assert "bad/name" not in profiles
+    assert "good-name" in profiles
+    assert sources["bad/name"]["source"] == "invalid"
+
+
+def test_effective_named_configs_lets_gateway_json_win_over_scanned(tmp_path, monkeypatch):
+    apps = tmp_path / "apps"
+    gw_json = tmp_path / "gateway.json"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"crispal-full": {"upstreams": ["aw-crispal"]}}
+    })
+    _write_json(gw_json, {"configs": {"crispal-full": {"upstreams": ["kb"]}}})
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(gw_json))
+
+    effective, _sources = config.effective_named_configs()
+
+    assert effective["crispal-full"] == {"upstreams": ["kb"]}
+
+
+def test_effective_named_configs_includes_a_scanned_only_profile(tmp_path, monkeypatch):
+    apps = tmp_path / "apps"
+    _write_json(apps / "app-a" / "gateway-profiles.json", {
+        "profiles": {"crispal-full": {"upstreams": ["aw-crispal"]}}
+    })
+    monkeypatch.setattr(config, "APP_SCAN_ROOTS", str(apps))
+    monkeypatch.setattr(config, "GATEWAY_JSON", str(tmp_path / "missing-gateway.json"))
+
+    effective, _sources = config.effective_named_configs()
+
+    assert effective["crispal-full"] == {"upstreams": ["aw-crispal"]}
+
+
 def test_load_specs_auto_trusts_scanned_servers_without_an_allowlist_entry(tmp_path, monkeypatch):
     """Installing an app is enough on its own — Gateway._load_specs() must
     start its contributed (scanned) server even with an empty self.allow.
