@@ -31,7 +31,12 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from gateway.upstream import GatewayUpstream, HttpUpstream, UPSTREAM_HTTP_TIMEOUT
+from gateway.upstream import (
+    HEALTH_CHECK_TIMEOUT,
+    GatewayUpstream,
+    HttpUpstream,
+    UPSTREAM_HTTP_TIMEOUT,
+)
 
 SLOW_TOOL = {"name": "slow_tool", "description": "", "inputSchema": {"type": "object"}}
 
@@ -165,3 +170,103 @@ async def test_dead_connect_is_not_swallowed_by_the_long_read_budget(monkeypatch
     up = HttpUpstream("svc", {"url": "http://127.0.0.1:1/mcp"})  # nothing listens here
     with pytest.raises(httpx.ConnectError):
         await up.start()
+
+
+def _zombie_health_check_app(hang_seconds: float) -> FastAPI:
+    """A stand-in for the exact upstream this card is about: the connection
+    is accepted and the FIRST tools/list (start()'s handshake) answers
+    normally, but every tools/list AFTER that — the health-check probe —
+    hangs, as a frozen process still listening on the port would."""
+    app = FastAPI()
+    calls = {"tools_list": 0}
+
+    @app.post("/mcp")
+    async def handle(request: Request):
+        body = await request.json()
+        method = body.get("method")
+        if method == "initialize":
+            return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"), "result": {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "serverInfo": {"name": "zombie-upstream", "version": "1.0.0"}}})
+        if method == "tools/list":
+            calls["tools_list"] += 1
+            if calls["tools_list"] == 1:
+                return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"),
+                                      "result": {"tools": [SLOW_TOOL]}})
+            await asyncio.sleep(hang_seconds)
+            return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"),
+                                  "result": {"tools": [SLOW_TOOL]}})
+        return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"), "result": {}})
+
+    return app
+
+
+def test_health_check_timeout_is_short_not_the_600s_read_budget():
+    """The whole fix in one assertion: a health-check probe must not share
+    UPSTREAM_HTTP_TIMEOUT's read=600.0, which exists for a slow-but-
+    eventually-successful tool call, not a liveness check."""
+    assert HEALTH_CHECK_TIMEOUT.read < UPSTREAM_HTTP_TIMEOUT.read
+    assert HEALTH_CHECK_TIMEOUT.read <= 10.0
+
+
+async def test_post_omits_timeout_kwarg_by_default_and_forwards_an_explicit_override(monkeypatch):
+    """Guards the exact httpx footgun this fix has to avoid: AsyncClient.post
+    treats an explicit ``timeout=None`` as "no timeout at all" (infinite),
+    not "use the client default" — so _post's default path must OMIT the
+    kwarg entirely rather than pass None through."""
+    captured: dict = {"calls": []}
+
+    class _FakeResponse:
+        headers: dict = {}
+        text = '{"jsonrpc": "2.0", "id": "x", "result": {}}'
+
+        @staticmethod
+        def raise_for_status():
+            pass
+
+        @staticmethod
+        def json():
+            return {"jsonrpc": "2.0", "id": "x", "result": {}}
+
+    async def _fake_post(self, url, *, json, headers, **kwargs):
+        captured["calls"].append(kwargs)
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+
+    up = HttpUpstream("svc", {"url": "http://example.invalid/mcp"})
+    up._client = httpx.AsyncClient(timeout=UPSTREAM_HTTP_TIMEOUT)
+    try:
+        await up._post({"jsonrpc": "2.0", "id": "x", "method": "tools/list"})
+        await up._post({"jsonrpc": "2.0", "id": "x", "method": "tools/list"},
+                        timeout=HEALTH_CHECK_TIMEOUT)
+    finally:
+        await up._client.aclose()
+
+    assert "timeout" not in captured["calls"][0]  # falls back to the client's own default
+    assert captured["calls"][1]["timeout"] == HEALTH_CHECK_TIMEOUT  # override forwarded verbatim
+
+
+async def test_health_check_does_not_inherit_the_600s_read_budget_on_a_real_hang(monkeypatch):
+    """End-to-end against a real socket: an upstream that accepts the
+    connection and then never answers the probe must fail health_check()
+    within HEALTH_CHECK_TIMEOUT, not UPSTREAM_HTTP_TIMEOUT's read=600.0.
+    HEALTH_CHECK_TIMEOUT is shrunk only so the test doesn't itself take
+    several seconds — the hang on the server side is real, not simulated."""
+    monkeypatch.setattr(
+        "gateway.upstream.HEALTH_CHECK_TIMEOUT",
+        httpx.Timeout(connect=0.2, read=0.3, write=0.2, pool=0.2),
+    )
+    async with running_app(_zombie_health_check_app(5.0), 19407) as base_url:
+        up = HttpUpstream("svc", {"url": f"{base_url}/mcp"})
+        await up.start()
+        try:
+            loop = asyncio.get_event_loop()
+            start = loop.time()
+            with pytest.raises(httpx.TimeoutException):
+                await up.health_check()
+            elapsed = loop.time() - start
+        finally:
+            await up.stop()
+
+    assert elapsed < 2.0  # bounded by HEALTH_CHECK_TIMEOUT (0.3s), nowhere near the 5s hang or 600s read

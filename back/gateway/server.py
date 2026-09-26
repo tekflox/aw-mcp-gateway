@@ -248,12 +248,15 @@ class Gateway:
           404/502 that never reached the real handler) — it's torn down and
           restarted exactly like `changed` above, parked on failure same as
           any other restart attempt. An unproven failure (e.g. a plain
-          ``ReadTimeout``) changes nothing: forcing a reconnect on ambiguous
-          evidence would be the same mistake `call_tool`'s own retry gate
-          already refuses to make. This is what lets an upstream whose real
-          backend moved (container recreated, IP reassigned) without its
-          spec changing recover on the next ~60s reload cycle instead of
-          needing a full gateway restart — see
+          ``ReadTimeout``) leaves the connection alone: forcing a reconnect
+          on ambiguous evidence would be the same mistake `call_tool`'s own
+          retry gate already refuses to make. It is still logged and counted
+          (``metrics.counters``, ``tools_call_errors.<class>``) and reported
+          back under this method's own ``health_check_ambiguous`` — leaving
+          it alone must not also mean leaving no trace. This is what lets an
+          upstream whose real backend moved (container recreated, IP
+          reassigned) without its spec changing recover on the next ~60s
+          reload cycle instead of needing a full gateway restart — see
           mcp-gateway-http-upstream-zombie-caching.
 
         Called by aw-workspace after an app with `contributes.mcp: true`
@@ -282,6 +285,7 @@ class Gateway:
         # container recreated with a new hostname, an IP reassigned — was
         # never noticed; see mcp-gateway-http-upstream-zombie-caching).
         dead_unchanged: set[str] = set()
+        ambiguous_unchanged: set[str] = set()
         for name in sorted(unchanged):
             up = self.upstreams.get(name)
             if not isinstance(up, HttpUpstream):
@@ -289,11 +293,24 @@ class Gateway:
             try:
                 await up.health_check()
             except Exception as exc:
-                _, proven = _classify_call_failure(exc)
+                error_class, proven = _classify_call_failure(exc)
                 if proven:
                     dead_unchanged.add(name)
-                # else: unproven (e.g. ReadTimeout) — leave it alone, same
-                # fail-closed rule call_tool's own retry gate already applies.
+                else:
+                    # Unproven (e.g. ReadTimeout) — leave the connection
+                    # alone, same fail-closed rule call_tool's own retry gate
+                    # already applies. That must not mean invisible, though:
+                    # every other failure this module tracks goes through
+                    # metrics.counters (resilience:gateway-proof-gated-retry-
+                    # with-counters — "nenhum retry entra sem contador" reads
+                    # equally as "nenhuma falha ambígua entra sem rastro"), and
+                    # an upstream repeatedly failing its health check
+                    # ambiguously is exactly the kind of thing a doctor/24h-
+                    # window reader needs to see before it ever proves dead.
+                    log.warning("upstream %s: health check inconclusive (%s) — "
+                                "leaving connection in place", name, exc)
+                    metrics.counters.record(name, f"tools_call_errors.{error_class}")
+                    ambiguous_unchanged.add(name)
         unchanged -= dead_unchanged
 
         # Real config removal — dropped right away, never parked. Only a
@@ -334,13 +351,21 @@ class Gateway:
                 self._unpark(name)
 
         log.info("gateway reload: +%d -%d ~%d changed, %d reconnected (dead health check), "
-                 "%d unchanged, %d failed, %d parked — %d local upstreams, %d tools now",
+                 "%d unchanged, %d ambiguous health check, %d failed, %d parked — "
+                 "%d local upstreams, %d tools now",
                  len(added), len(removed), len(changed), len(dead_unchanged), len(unchanged),
-                 len(failed), len(self.unavailable), len(self.upstreams), len(self.agg_tools))
+                 len(ambiguous_unchanged), len(failed), len(self.unavailable),
+                 len(self.upstreams), len(self.agg_tools))
         return {
             "added": sorted(added), "removed": sorted(removed),
             "changed": sorted(changed), "reconnected": sorted(dead_unchanged),
             "unchanged": sorted(unchanged),
+            # Health-checked but inconclusive (e.g. ReadTimeout) — left
+            # running untouched, same as `unchanged`, but broken out so this
+            # isn't the only one of reload()'s outcomes with no trace in its
+            # own return value (see the log.warning + metrics.counters.record
+            # at the point this is populated, above).
+            "health_check_ambiguous": sorted(ambiguous_unchanged),
             "failed": failed, "parked": sorted(self.unavailable),
             "upstreams": sorted(self.upstreams), "tools": len(self.agg_tools),
         }

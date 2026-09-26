@@ -10,11 +10,14 @@ HTTP family (stdio already self-heals via ``Upstream._ensure_alive()``).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 
 import httpx
+import pytest
 
 from gateway import config as config_module
+from gateway import metrics
 from gateway.server import Gateway
 from gateway.upstream import HttpUpstream
 
@@ -38,6 +41,16 @@ def _servers(servers: dict):
         config_module.load_mcp_servers = original
 
 
+@pytest.fixture(autouse=True)
+def _reset_counters():
+    """metrics.counters is a process-wide singleton (test_proof_gated_retry.py's
+    identical fixture) — this file's ambiguous-health-check test asserts an
+    exact count, which must not depend on what ran before it."""
+    metrics.counters._events.clear()
+    yield
+    metrics.counters._events.clear()
+
+
 async def test_unchanged_http_upstream_recovers_from_a_dead_connection_without_a_spec_change(monkeypatch):
     """The exact gap the incidents exposed: an HTTP upstream whose spec never
     changes is never touched by reload()'s changed/added/parked_retry loop.
@@ -53,7 +66,7 @@ async def test_unchanged_http_upstream_recovers_from_a_dead_connection_without_a
         generation["n"] += 1
         self._gen = generation["n"]
 
-    async def _post(self, msg):
+    async def _post(self, msg, *, timeout=None):
         method = msg.get("method")
         if method == "initialize":
             return {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"serverInfo": {"name": "svc"}}}
@@ -100,14 +113,19 @@ async def test_unchanged_http_upstream_recovers_from_a_dead_connection_without_a
     assert resp["result"]["isError"] is False
 
 
-async def test_unchanged_http_upstream_health_check_ignores_ambiguous_failure(monkeypatch):
+async def test_unchanged_http_upstream_health_check_ignores_ambiguous_failure(monkeypatch, caplog):
     """A ReadTimeout on the health-check probe PROVES nothing — the request
     may have reached the real handler and only the response got lost.
     Forcing a reconnect on that evidence would repeat the exact mistake
-    call_tool's own proof-gated retry already refuses to make."""
+    call_tool's own proof-gated retry already refuses to make.
+
+    But "leave it alone" must not also mean "leave no trace" — a repeatedly
+    ambiguous health check on the same upstream needs to show up somewhere a
+    doctor/24h-window reader would look: a log line, metrics.counters, and
+    reload()'s own return value (all three were silent before this test)."""
     calls = {"n": 0}
 
-    async def _post(self, msg):
+    async def _post(self, msg, *, timeout=None):
         method = msg.get("method")
         if method == "initialize":
             return {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"serverInfo": {"name": "svc"}}}
@@ -126,13 +144,88 @@ async def test_unchanged_http_upstream_health_check_ignores_ambiguous_failure(mo
         await gw.start()
     original_upstream = gw.upstreams["svc"]
 
-    with _servers({"svc": HTTP_SPEC}):
+    with _servers({"svc": HTTP_SPEC}), caplog.at_level("WARNING", logger="aw-mcp-gateway"):
         result = await gw.reload()
 
     assert result["reconnected"] == []
     assert result["unchanged"] == ["svc"]
+    assert result["health_check_ambiguous"] == ["svc"]  # was invisible in the return dict
     assert gw.upstreams["svc"] is original_upstream  # never torn down
     assert "svc" not in gw.unavailable
+
+    # metrics.counters — reuses the same tools_call_errors.<class> taxonomy
+    # call_tool's own retry gate already records on failure.
+    snapshot = metrics.counters.snapshot(["svc"])
+    assert snapshot["svc"]["tools_call_errors"]["timeout"] == 1
+
+    # log — a repeatedly-ambiguous upstream must leave a trail, not just a
+    # one-shot metric nobody is watching in real time.
+    assert any("svc" in r.message and "health check inconclusive" in r.message
+               for r in caplog.records)
+
+
+async def test_unchanged_http_upstream_health_check_does_not_hang_on_a_dead_but_connected_upstream(monkeypatch):
+    """The scenario this card exists to catch: an upstream that accepted the
+    TCP connection but never answers (a frozen process still listening on
+    the port, a proxy holding the connection open). Before HEALTH_CHECK_TIMEOUT
+    existed, health_check() reused UPSTREAM_HTTP_TIMEOUT's read=600.0 verbatim
+    and would hang for up to 10 minutes here — and since Gateway.reload()
+    awaits this SEQUENTIALLY over every `unchanged` upstream, it would have
+    blocked every other upstream in the same reload() cycle behind it too.
+
+    The mocked ``_post`` below enforces the SAME timeout ``health_check()``
+    hands it (asserted explicitly), so this proves the value actually
+    threads through end-to-end rather than merely existing as a constant —
+    the real socket-level enforcement is covered separately by
+    test_upstream_http_timeout.py's pattern against a live server."""
+    monkeypatch.setattr(
+        "gateway.upstream.HEALTH_CHECK_TIMEOUT",
+        httpx.Timeout(connect=0.1, read=0.2, write=0.1, pool=0.1),
+    )
+    calls = {"n": 0}
+    never_respond = asyncio.Event()  # deliberately never set
+
+    async def _post(self, msg, *, timeout=None):
+        method = msg.get("method")
+        if method == "initialize":
+            return {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"serverInfo": {"name": "svc"}}}
+        if method == "tools/list":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"jsonrpc": "2.0", "id": msg.get("id"),
+                         "result": {"tools": [{"name": "echo", "description": "d"}]}}
+            # A hung zombie never answers — bounded strictly by whatever
+            # timeout health_check() actually passed in, not the client's
+            # own 600s read default (which this test would time out against
+            # if health_check() ever regressed to inheriting it again).
+            assert timeout is not None and timeout.read == 0.2
+            try:
+                await asyncio.wait_for(never_respond.wait(), timeout=timeout.read)
+            except asyncio.TimeoutError:
+                raise httpx.ReadTimeout("simulated hang past health-check timeout") from None
+            raise AssertionError("unreachable — wait_for above must time out first")
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(HttpUpstream, "_post", _post)
+
+    gw = Gateway(["svc"])
+    with _servers({"svc": HTTP_SPEC}):
+        await gw.start()
+
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    with _servers({"svc": HTTP_SPEC}):
+        # The outer 5s bound is a safety net, not the real assertion below —
+        # if health_check() ever regressed to the 600s read budget, this
+        # would fail the test suite by timing out rather than hanging it.
+        result = await asyncio.wait_for(gw.reload(), timeout=5.0)
+    elapsed = loop.time() - start
+
+    assert result["health_check_ambiguous"] == ["svc"]
+    assert elapsed < 1.0  # bounded by HEALTH_CHECK_TIMEOUT (0.2s), nowhere near 600s
+
+    snapshot = metrics.counters.snapshot(["svc"])
+    assert snapshot["svc"]["tools_call_errors"]["timeout"] == 1
 
 
 async def test_stdio_unchanged_upstream_is_never_health_checked():

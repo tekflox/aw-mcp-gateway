@@ -62,6 +62,23 @@ HANDSHAKE_TIMEOUT_SECONDS = 30.0
 #: timeout bug on a Telegram download leg.
 UPSTREAM_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
 
+#: HttpUpstream.health_check() used to make its probe POST through ``_post``
+#: with no timeout override, so it inherited UPSTREAM_HTTP_TIMEOUT's full
+#: read=600.0 budget verbatim — generous on purpose for a slow-but-eventually-
+#: successful tool call, but exactly wrong for a "cheap liveness probe": an
+#: upstream that accepts the TCP connection but never answers (a frozen
+#: process still listening on the port, a proxy holding the connection open)
+#: is the very zombie this probe exists to catch, and it would hang
+#: health_check() for up to 10 minutes instead. Since Gateway.reload() awaits
+#: this SEQUENTIALLY over every `unchanged` upstream in one cycle, that one
+#: hang used to stall every other unchanged upstream and the whole reload()
+#: call behind it — worse than the bug being fixed, which cost zero network
+#: calls for an unchanged upstream. A short, dedicated budget bounds the
+#: worst case to a few seconds; a timeout here still comes back through
+#: _classify_call_failure as unproven (fail-closed), same as any other
+#: ambiguous health-check failure.
+HEALTH_CHECK_TIMEOUT = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
+
 #: Correlation ids owned by THIS gateway process, for the transports that
 #: multiplex many concurrent callers over ONE shared connection (the stdio
 #: ``Upstream`` child, the ``/link`` ``RemoteUpstream`` WebSocket).
@@ -358,9 +375,15 @@ class HttpUpstream:
             headers["Mcp-Session-Id"] = self._session_id
         return headers
 
-    async def _post(self, msg: dict) -> dict:
+    async def _post(self, msg: dict, *, timeout: httpx.Timeout | None = None) -> dict:
         assert self._client is not None
-        resp = await self._client.post(self.url, json=msg, headers=self._client_headers())
+        # Only pass `timeout` through when the caller wants an override —
+        # httpx treats an explicit `timeout=None` as "no timeout at all"
+        # (infinite), not "use the client default", so omitting the kwarg
+        # entirely is the only way to fall back to self._client's own
+        # UPSTREAM_HTTP_TIMEOUT.
+        kwargs = {"timeout": timeout} if timeout is not None else {}
+        resp = await self._client.post(self.url, json=msg, headers=self._client_headers(), **kwargs)
         resp.raise_for_status()
         session_id = resp.headers.get("mcp-session-id")
         if session_id:
@@ -429,8 +452,14 @@ class HttpUpstream:
         caller (``Gateway.reload()``) runs that exception through
         ``_classify_call_failure``, the same proof gate ``call_tool``'s own
         retry already applies, before deciding whether it proves the
-        connection is dead. See mcp-gateway-http-upstream-zombie-caching."""
-        await self._post({"jsonrpc": "2.0", "id": "healthcheck", "method": "tools/list"})
+        connection is dead. See mcp-gateway-http-upstream-zombie-caching.
+
+        Uses HEALTH_CHECK_TIMEOUT, not this client's full UPSTREAM_HTTP_TIMEOUT
+        — a probe has no business inheriting the 600s read budget meant for a
+        slow-but-eventually-successful tool call; see that constant's
+        docstring."""
+        await self._post({"jsonrpc": "2.0", "id": "healthcheck", "method": "tools/list"},
+                          timeout=HEALTH_CHECK_TIMEOUT)
 
     async def call_tool(self, tool: str, arguments: dict, req_id, *, idempotent_hint: bool = False) -> dict:
         # Non-recursive federation (resilience:gateway-proof-gated-retry-with-
