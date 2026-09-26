@@ -422,6 +422,16 @@ class HttpUpstream:
         self.tools = listed.get("result", {}).get("tools", [])
         log.info("http upstream %s — %d tools", self.name, len(self.tools))
 
+    async def health_check(self) -> None:
+        """Cheap liveness probe for an upstream ``Gateway.reload()`` left
+        running untouched because its spec didn't change — a ``tools/list``
+        against the same client/URL already in use. Raises on failure; the
+        caller (``Gateway.reload()``) runs that exception through
+        ``_classify_call_failure``, the same proof gate ``call_tool``'s own
+        retry already applies, before deciding whether it proves the
+        connection is dead. See mcp-gateway-http-upstream-zombie-caching."""
+        await self._post({"jsonrpc": "2.0", "id": "healthcheck", "method": "tools/list"})
+
     async def call_tool(self, tool: str, arguments: dict, req_id, *, idempotent_hint: bool = False) -> dict:
         # Non-recursive federation (resilience:gateway-proof-gated-retry-with-
         # counters, decision 4): a gateway that received THIS call from

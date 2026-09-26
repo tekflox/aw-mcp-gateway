@@ -28,6 +28,7 @@ from .upstream import (
     GatewayUpstream,
     HttpUpstream,
     Upstream,
+    _classify_call_failure,
     public_name,
 )
 
@@ -237,8 +238,23 @@ class Gateway:
           backoff) having to exist yet.
         * added (new name) — started fresh. Nothing to park on failure —
           it never had routes to begin with.
-        * unchanged (live, same spec) — left running as-is, no reconnect
-          churn.
+        * unchanged (live, same spec) — health-checked instead of just left
+          alone: an HTTP upstream (stdio already self-heals via
+          ``Upstream._ensure_alive()``, so it's skipped) gets a cheap
+          ``tools/list`` probe against its existing connection. If that
+          PROVES the connection is dead — the same test
+          ``_classify_call_failure`` already applies to a failed
+          ``call_tool`` retry (``ConnectError``/``ConnectTimeout``, or a
+          404/502 that never reached the real handler) — it's torn down and
+          restarted exactly like `changed` above, parked on failure same as
+          any other restart attempt. An unproven failure (e.g. a plain
+          ``ReadTimeout``) changes nothing: forcing a reconnect on ambiguous
+          evidence would be the same mistake `call_tool`'s own retry gate
+          already refuses to make. This is what lets an upstream whose real
+          backend moved (container recreated, IP reassigned) without its
+          spec changing recover on the next ~60s reload cycle instead of
+          needing a full gateway restart — see
+          mcp-gateway-http-upstream-zombie-caching.
 
         Called by aw-workspace after an app with `contributes.mcp: true`
         saves its config (that app is expected to have already rewritten
@@ -260,6 +276,26 @@ class Gateway:
                   if n not in self.unavailable and self.upstreams[n].spec != new_specs[n]}
         unchanged = common - changed - parked_retry
 
+        # Active health check for the upstreams the diff above leaves alone
+        # (resilience: an unchanged-spec HTTP upstream never had start()
+        # called on it again, so a connection that died underneath it — a
+        # container recreated with a new hostname, an IP reassigned — was
+        # never noticed; see mcp-gateway-http-upstream-zombie-caching).
+        dead_unchanged: set[str] = set()
+        for name in sorted(unchanged):
+            up = self.upstreams.get(name)
+            if not isinstance(up, HttpUpstream):
+                continue  # stdio already self-heals via Upstream._ensure_alive()
+            try:
+                await up.health_check()
+            except Exception as exc:
+                _, proven = _classify_call_failure(exc)
+                if proven:
+                    dead_unchanged.add(name)
+                # else: unproven (e.g. ReadTimeout) — leave it alone, same
+                # fail-closed rule call_tool's own retry gate already applies.
+        unchanged -= dead_unchanged
+
         # Real config removal — dropped right away, never parked. Only a
         # name that FAILS to (re)start below gets parked, with a TTL.
         for name in removed:
@@ -270,9 +306,9 @@ class Gateway:
             self._unpark(name)
 
         failed: list[dict] = []
-        for name in sorted(added | changed | parked_retry):
+        for name in sorted(added | changed | parked_retry | dead_unchanged):
             prior_tools: list[dict] | None = None
-            if name in changed:
+            if name in changed or name in dead_unchanged:
                 prior_up = self.upstreams.pop(name, None)
                 if prior_up is not None:
                     prior_tools = list(prior_up.tools)
@@ -297,13 +333,14 @@ class Gateway:
             else:
                 self._unpark(name)
 
-        log.info("gateway reload: +%d -%d ~%d changed, %d unchanged, %d failed, %d parked — "
-                 "%d local upstreams, %d tools now",
-                 len(added), len(removed), len(changed), len(unchanged), len(failed),
-                 len(self.unavailable), len(self.upstreams), len(self.agg_tools))
+        log.info("gateway reload: +%d -%d ~%d changed, %d reconnected (dead health check), "
+                 "%d unchanged, %d failed, %d parked — %d local upstreams, %d tools now",
+                 len(added), len(removed), len(changed), len(dead_unchanged), len(unchanged),
+                 len(failed), len(self.unavailable), len(self.upstreams), len(self.agg_tools))
         return {
             "added": sorted(added), "removed": sorted(removed),
-            "changed": sorted(changed), "unchanged": sorted(unchanged),
+            "changed": sorted(changed), "reconnected": sorted(dead_unchanged),
+            "unchanged": sorted(unchanged),
             "failed": failed, "parked": sorted(self.unavailable),
             "upstreams": sorted(self.upstreams), "tools": len(self.agg_tools),
         }
