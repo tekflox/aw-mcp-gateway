@@ -36,10 +36,15 @@ def _http_status_error(status: int) -> httpx.HTTPStatusError:
 
 def _scripted_post(behaviors):
     """Same fake as test_proof_gated_retry.py's ``_scripted_post`` — behaviors[i]
-    is either an Exception to raise on the i-th call, or a dict to return."""
+    is either an Exception to raise on the i-th call, or a dict to return.
+
+    Accepts (and ignores) the ``timeout`` kwarg real ``_post`` callers now
+    pass explicitly for the handshake (HANDSHAKE_HTTP_TIMEOUT) — this fake
+    only cares about the scripted response sequence, not which budget a
+    real httpx call would have used."""
     calls = {"n": 0}
 
-    async def _post(msg):
+    async def _post(msg, *, timeout=None):
         i = min(calls["n"], len(behaviors) - 1)
         calls["n"] += 1
         behavior = behaviors[i]
