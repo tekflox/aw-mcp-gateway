@@ -24,7 +24,7 @@ import os
 
 import httpx
 
-from . import caller_context, metrics
+from . import caller_context, config, metrics
 
 from .config import BASE_DIR
 
@@ -170,7 +170,13 @@ class Upstream:
         if not os.path.isabs(cmd) and ("/" in cmd):
             cmd = os.path.join(BASE_DIR, cmd)
         env = dict(os.environ)
-        env.update(self.env_extra)
+        # Resolve any ${secret:<name>} refs at spawn time, from self.env_extra
+        # (the reference form, straight off spec["env"]) — never store the
+        # resolved value back onto self.env_extra/self.spec, see
+        # config.resolve_secret_refs's docstring. A crash/respawn always goes
+        # back through this same _spawn(), so a rotated secret takes effect
+        # on the upstream's next restart without any extra plumbing.
+        env.update(config.resolve_secret_refs(self.env_extra))
         env.setdefault("PYTHONUNBUFFERED", "1")
         self.proc = await asyncio.create_subprocess_exec(
             cmd, *self.args,
@@ -363,13 +369,20 @@ class HttpUpstream:
         self._session_id: str | None = None
 
     def _client_headers(self) -> dict[str, str]:
+        # Resolved fresh on every request (mtime-cached inside
+        # config.resolve_secret_refs) — self._extra_headers stays in
+        # reference form, never mutated, so a rotated secret takes effect on
+        # this upstream's very next call with no restart. See that
+        # function's docstring for why the resolved value must never be
+        # written back into self.spec/self._extra_headers.
+        resolved_headers = config.resolve_secret_refs(self._extra_headers)
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
             # Who is on the far side of this gateway. Without it an upstream
             # sees every agent as the same caller — see caller_context.
             **caller_context.current(),
-            **self._extra_headers,
+            **resolved_headers,
         }
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id

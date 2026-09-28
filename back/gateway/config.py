@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 from pathlib import Path
 
@@ -28,6 +29,15 @@ MCP_JSON = os.environ.get("AW_MCP_JSON", os.path.join(BASE_DIR, "config", "mcp.j
 MCP_CUSTOM_JSON = os.environ.get(
     "AW_MCP_CUSTOM_JSON", os.path.join(BASE_DIR, "config", "mcp.custom.json"))
 GATEWAY_JSON = os.environ.get("AW_GATEWAY_JSON", os.path.join(BASE_DIR, "config", "gateway.json"))
+#: Write-only side store for external-upstream credentials (env values, HTTP
+#: header values) referenced from ``mcp.custom.json`` as ``${secret:<name>}``
+#: — never the raw value. Kept OUT of mcp.custom.json/mcp.json so a value
+#: never round-trips through effective_mcp_config()'s write_final=True
+#: (mcp.json is host-visible) or an /admin/config GET response. Plain JSON,
+#: 0600 — same trust posture as gateway.json's own bearer token, which lives
+#: on the same $AW_APP_DATA volume.
+UPSTREAM_SECRETS_JSON = os.environ.get(
+    "AW_UPSTREAM_SECRETS_JSON", os.path.join(BASE_DIR, "config", "upstream_secrets.json"))
 LINK_TOKENS_JSON = os.environ.get("AW_LINK_TOKENS_JSON", os.path.join(BASE_DIR, "config", "link_tokens.json"))
 APP_SCAN_ROOTS = os.environ.get("AW_APP_SCAN_ROOTS", "/opt/aw-workspace/apps")
 
@@ -189,6 +199,105 @@ def save_gateway_config(data: dict) -> dict:
     a partial save never drops the minted ``token``/``gateway_id``."""
     _write_json(GATEWAY_JSON, data)
     return data
+
+
+#: ``${secret:<name>}`` — substring interpolation (not whole-value
+#: replacement), so a header like ``"Bearer ${secret:google-token}"`` works.
+_SECRET_REF_RE = re.compile(r"\$\{secret:([^}]+)\}")
+
+#: (path, mtime) -> secrets dict. Read-heavy path: HttpUpstream._client_headers()
+#: calls resolve_secret_refs() on EVERY outbound request, so re-parsing the
+#: file on every call would put disk I/O on the hot path for no reason — it
+#: only changes on an explicit save/delete below (which also updates this
+#: cache directly, so a save is visible immediately regardless of the
+#: filesystem's mtime resolution) or when the path itself is monkeypatched
+#: (e.g. in tests), which the path half of the key also catches.
+_secrets_cache: dict = {"key": None, "data": {}}
+
+
+def _load_upstream_secrets() -> dict:
+    path = UPSTREAM_SECRETS_JSON
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    key = (path, mtime)
+    if _secrets_cache["key"] != key:
+        data = _read_json(path, {"secrets": {}})
+        raw = data.get("secrets")
+        _secrets_cache["data"] = dict(raw) if isinstance(raw, dict) else {}
+        _secrets_cache["key"] = key
+    return _secrets_cache["data"]
+
+
+def _write_upstream_secrets(data: dict) -> None:
+    path = UPSTREAM_SECRETS_JSON
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump({"secrets": data}, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)  # os.replace preserves the source file's mode
+    _secrets_cache["key"] = (path, os.path.getmtime(path))
+    _secrets_cache["data"] = dict(data)
+
+
+def load_upstream_secret_names() -> set[str]:
+    """Names of every stored upstream secret — values are never returned by
+    this module to a caller other than resolve_secret_refs() itself."""
+    return set(_load_upstream_secrets())
+
+
+def save_upstream_secret(name: str, value: str) -> None:
+    data = dict(_load_upstream_secrets())
+    data[name] = value
+    _write_upstream_secrets(data)
+
+
+def delete_upstream_secret(name: str) -> None:
+    data = dict(_load_upstream_secrets())
+    if name in data:
+        del data[name]
+        _write_upstream_secrets(data)
+
+
+def secret_ref_names(mapping: dict | None) -> set[str]:
+    """Every ``${secret:<name>}`` name referenced anywhere in ``mapping``'s
+    values (e.g. an upstream spec's ``env`` or ``headers``) — used to find
+    which stored secrets are still needed when an upstream is deleted."""
+    names: set[str] = set()
+    for value in (mapping or {}).values():
+        names.update(_SECRET_REF_RE.findall(str(value)))
+    return names
+
+
+def resolve_secret_refs(mapping: dict | None) -> dict:
+    """Resolve every ``${secret:<name>}`` substring in each value of
+    ``mapping`` against ``config/upstream_secrets.json``. Called at USE time
+    only (``Upstream.start()`` at spawn, ``HttpUpstream._client_headers()``
+    per request) — the resolved result must never be written back into an
+    upstream's ``spec``, or ``Gateway.reload()``'s ``up.spec != new_specs[n]``
+    diff (server.py) would see the reference-form config as permanently
+    "changed". Raises ``ValueError`` naming the unknown ref — never silently
+    drops it or leaves the literal placeholder in an env var / header, either
+    of which would fail in a way that hides the real cause.
+    """
+    if not mapping:
+        return dict(mapping or {})
+    secrets_map = _load_upstream_secrets()
+
+    def _resolve(value: str) -> str:
+        def _sub(m: "re.Match[str]") -> str:
+            name = m.group(1)
+            if name not in secrets_map:
+                raise ValueError(
+                    f"unknown secret reference '${{secret:{name}}}' — "
+                    f"no upstream secret named {name!r} is stored")
+            return secrets_map[name]
+        return _SECRET_REF_RE.sub(_sub, value)
+
+    return {key: _resolve(str(val)) for key, val in mapping.items()}
 
 
 #: A named config's key doubles as a URL path segment (``/mcp/<name>``), so it

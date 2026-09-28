@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from starlette.testclient import TestClient
 
 from gateway import config
@@ -586,6 +587,128 @@ async def test_reload_leaves_an_unchanged_server_running_untouched(tmp_path, mon
     assert result["unchanged"] == ["echo"]
     assert result["added"] == [] and result["removed"] == [] and result["changed"] == []
     assert gw.upstreams["echo"] is old_upstream  # same process, not restarted
+
+
+def _isolate_upstream_secrets(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "UPSTREAM_SECRETS_JSON", str(tmp_path / "upstream_secrets.json"))
+    config._secrets_cache["key"] = None
+    config._secrets_cache["data"] = {}
+
+
+def test_save_and_load_upstream_secret_names(tmp_path, monkeypatch):
+    _isolate_upstream_secrets(tmp_path, monkeypatch)
+    assert config.load_upstream_secret_names() == set()
+
+    config.save_upstream_secret("google-token", "sekrit")
+    config.save_upstream_secret("other", "value")
+
+    assert config.load_upstream_secret_names() == {"google-token", "other"}
+
+
+def test_upstream_secrets_file_never_contains_names_in_plaintext_next_to_value_leak(tmp_path, monkeypatch):
+    """Sanity check on the on-disk shape: a raw grep for the stored value
+    must find it (it's a plaintext side-store, not encrypted — see the
+    Architect design's rejected-alternative #3) but the file itself must be
+    0600, not world/group readable."""
+    _isolate_upstream_secrets(tmp_path, monkeypatch)
+    config.save_upstream_secret("google-token", "sekrit-value")
+
+    path = tmp_path / "upstream_secrets.json"
+    assert "sekrit-value" in path.read_text()
+    mode = path.stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_delete_upstream_secret_removes_it(tmp_path, monkeypatch):
+    _isolate_upstream_secrets(tmp_path, monkeypatch)
+    config.save_upstream_secret("a", "1")
+    config.save_upstream_secret("b", "2")
+
+    config.delete_upstream_secret("a")
+
+    assert config.load_upstream_secret_names() == {"b"}
+
+
+def test_delete_upstream_secret_is_a_noop_for_an_unknown_name(tmp_path, monkeypatch):
+    _isolate_upstream_secrets(tmp_path, monkeypatch)
+    config.delete_upstream_secret("never-existed")  # must not raise
+    assert config.load_upstream_secret_names() == set()
+
+
+def test_resolve_secret_refs_substitutes_whole_value(tmp_path, monkeypatch):
+    _isolate_upstream_secrets(tmp_path, monkeypatch)
+    config.save_upstream_secret("google-token", "the-real-token")
+
+    resolved = config.resolve_secret_refs({"GOOGLE_TOKEN": "${secret:google-token}"})
+
+    assert resolved == {"GOOGLE_TOKEN": "the-real-token"}
+
+
+def test_resolve_secret_refs_substring_interpolation(tmp_path, monkeypatch):
+    """The card's exact example: a Bearer header built around a ref, not
+    equal to it — substring replacement, not whole-value match."""
+    _isolate_upstream_secrets(tmp_path, monkeypatch)
+    config.save_upstream_secret("google-token", "abc123")
+
+    resolved = config.resolve_secret_refs({"Authorization": "Bearer ${secret:google-token}"})
+
+    assert resolved == {"Authorization": "Bearer abc123"}
+
+
+def test_resolve_secret_refs_leaves_plain_values_untouched(tmp_path, monkeypatch):
+    _isolate_upstream_secrets(tmp_path, monkeypatch)
+    resolved = config.resolve_secret_refs({"PLAIN": "no-ref-here"})
+    assert resolved == {"PLAIN": "no-ref-here"}
+
+
+def test_resolve_secret_refs_unknown_ref_raises_clear_error(tmp_path, monkeypatch):
+    _isolate_upstream_secrets(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="missing-secret"):
+        config.resolve_secret_refs({"X": "${secret:missing-secret}"})
+
+
+def test_resolve_secret_refs_does_not_mutate_input_mapping(tmp_path, monkeypatch):
+    """Guards the "never store resolved values into upstream.spec" rule at
+    its source: the function must hand back a NEW dict, never write through
+    into the caller's own mapping (which, in upstream.py, IS self.env_extra /
+    self._extra_headers — mutating it in place would be just as bad as
+    assigning the result back onto self.spec)."""
+    _isolate_upstream_secrets(tmp_path, monkeypatch)
+    config.save_upstream_secret("s", "value")
+    original = {"K": "${secret:s}"}
+
+    resolved = config.resolve_secret_refs(original)
+
+    assert original == {"K": "${secret:s}"}
+    assert resolved == {"K": "value"}
+
+
+def test_resolve_secret_refs_picks_up_a_save_immediately_despite_mtime_cache(tmp_path, monkeypatch):
+    """The mtime cache must never serve a stale value across an explicit
+    save — save_upstream_secret updates the cache directly rather than
+    relying on the filesystem's mtime resolution (which can be coarser than
+    two writes happening in the same test)."""
+    _isolate_upstream_secrets(tmp_path, monkeypatch)
+    config.save_upstream_secret("rotating", "v1")
+    assert config.resolve_secret_refs({"K": "${secret:rotating}"}) == {"K": "v1"}
+
+    config.save_upstream_secret("rotating", "v2")
+    assert config.resolve_secret_refs({"K": "${secret:rotating}"}) == {"K": "v2"}
+
+
+def test_secret_ref_names_extracts_every_referenced_name(tmp_path, monkeypatch):
+    names = config.secret_ref_names({
+        "A": "${secret:one}",
+        "B": "prefix-${secret:two}-suffix",
+        "C": "no ref",
+    })
+    assert names == {"one", "two"}
+
+
+def test_secret_ref_names_empty_for_empty_mapping():
+    assert config.secret_ref_names({}) == set()
+    assert config.secret_ref_names(None) == set()
 
 
 def test_reload_endpoint_requires_admin_auth(tmp_path, monkeypatch):

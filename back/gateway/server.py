@@ -769,6 +769,174 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
         configs.agents_base = config.agents_base()
         return result
 
+    def _external_upstream_status(name: str, spec: dict) -> dict:
+        """Live status for one external-upstream entry — ``spec`` stays in
+        reference form (as stored in mcp.custom.json), never resolved, so
+        this is safe to return straight from a GET/PUT response."""
+        parked = gateway.unavailable.get(name)
+        running = name in gateway.upstreams
+        return {
+            "name": name,
+            "spec": spec,
+            "enabled": spec.get("enabled") is not False,
+            "status": "error" if parked else ("running" if running else "stopped"),
+            "error": parked["error"] if parked else None,
+            "tools": sum(1 for r in gateway.routes.values() if r[0] == name) if running else 0,
+        }
+
+    def _external_upstreams_payload() -> list[dict]:
+        # write_final=False: a GET here must never trigger the mcp.json
+        # rewrite /admin/config's own contract relies on — nothing here
+        # needs it, and the refs in mcp.custom.json stay unresolved either
+        # way (see resolve_secret_refs's docstring on the write hazard).
+        effective = config.effective_mcp_config(write_final=False)
+        sources = effective["sources"]
+        custom_servers = effective["custom"]["mcpServers"]
+        return [
+            _external_upstream_status(name, spec)
+            for name, spec in sorted(custom_servers.items())
+            if sources.get(name, {}).get("source") == "custom"
+        ]
+
+    def _spec_secret_refs(spec: dict) -> set[str]:
+        return (config.secret_ref_names(spec.get("env")) |
+                config.secret_ref_names(spec.get("headers")))
+
+    @app.get("/admin/external-upstreams")
+    async def get_external_upstreams(
+        authorization: str | None = Header(default=None),
+        workspace_identity: str | None = Header(default=None, alias="X-AW-Identity-Sub"),
+    ):
+        """Every hand-registered external upstream (added via PUT below), with
+        live status. Never returns a secret value — only the ``${secret:...}``
+        reference each spec already carries."""
+        _check_admin_auth(authorization, workspace_identity)
+        return {"upstreams": _external_upstreams_payload()}
+
+    @app.put("/admin/external-upstreams/{name}")
+    async def put_external_upstream(
+        name: str, request: Request,
+        authorization: str | None = Header(default=None),
+        workspace_identity: str | None = Header(default=None, alias="X-AW-Identity-Sub"),
+    ):
+        """Add or edit ONE external upstream, end to end: store any given
+        secrets, merge the (reference-form) spec into mcp.custom.json, sync
+        the allowlist (gateway.json on disk AND this process's in-memory
+        gateway.allow — see main()'s allow_env handling above, the trap a
+        raw /admin/config save falls into), hot-reload, and return that
+        upstream's live start result so a bad URL/credential surfaces
+        immediately instead of only on the next unrelated reload.
+
+        Body: ``{"spec": {...}, "secrets": {"<name>": "<value>", ...}}``.
+        ``spec`` should reference any credential as ``${secret:<name>}``
+        rather than embed it — this endpoint does not scrub embedded
+        literals, it only ever stores what's under ``secrets`` into the side
+        store and never persists a resolved value anywhere.
+        """
+        _check_admin_auth(authorization, workspace_identity)
+        body = await request.json()
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be an object"}, status_code=400)
+        spec = body.get("spec")
+        if not isinstance(spec, dict):
+            return JSONResponse({"error": "'spec' must be an object"}, status_code=400)
+        kind = spec.get("type", "stdio")
+        if kind not in ("stdio", "http"):
+            return JSONResponse(
+                {"error": f"unsupported type {kind!r} — must be 'stdio' or 'http'"}, status_code=400)
+        if kind == "stdio" and not spec.get("command"):
+            return JSONResponse({"error": "a stdio upstream needs 'command'"}, status_code=400)
+        if kind == "http" and not spec.get("url"):
+            return JSONResponse({"error": "an http upstream needs 'url'"}, status_code=400)
+
+        scanned, _sources = config.scan_app_mcp_servers()
+        if name in scanned:
+            return JSONResponse(
+                {"error": f"'{name}' is provided by an installed app — cannot be overridden here"},
+                status_code=409)
+
+        secrets_body = body.get("secrets") or {}
+        if not isinstance(secrets_body, dict):
+            return JSONResponse({"error": "'secrets' must be an object"}, status_code=400)
+        for secret_name, secret_value in secrets_body.items():
+            config.save_upstream_secret(str(secret_name), str(secret_value))
+
+        custom = config.load_custom_mcp_config()
+        custom["mcpServers"][name] = spec
+        config.save_custom_mcp_config(custom)
+
+        # Allowlist sync — the fix for the "saved, but never actually
+        # starts" trap: gateway.json's `upstreams` list is what a process
+        # restart reads (main(), above), while gateway.allow is what THIS
+        # already-running process's _load_specs() checks right now. Both
+        # need the name or a hand-added custom entry silently never loads.
+        gw_cfg = config.load_gateway_config()
+        upstreams_list = list(gw_cfg.get("upstreams") or [])
+        if name not in upstreams_list:
+            upstreams_list.append(name)
+            gw_cfg["upstreams"] = upstreams_list
+            config.save_gateway_config(gw_cfg)
+        if name not in gateway.allow:
+            gateway.allow.append(name)
+
+        result = await gateway.reload()
+        entry = _external_upstream_status(name, spec)
+        if entry["error"] is None:
+            # A brand-new upstream that fails its very first start is NOT
+            # parked (Gateway.reload(): nothing to park, it never had routes
+            # to preserve) — so the plain unavailable-lookup above finds
+            # nothing. Surface the failure from reload()'s own report
+            # anyway, so a bad command/URL/secret ref shows up clearly on
+            # the very save that introduced it, not just from the next
+            # periodic rescan onward.
+            failed_entry = next((f for f in result.get("failed", []) if f["name"] == name), None)
+            if failed_entry:
+                entry["status"] = "error"
+                entry["error"] = failed_entry["error"]
+        entry["reload"] = result
+        if os.environ.get("AW_MCP_GATEWAY_ALLOW", "").strip():
+            entry["warning"] = (
+                "AW_MCP_GATEWAY_ALLOW is set for this container — config/gateway.json's "
+                "upstreams list is ignored at boot, so this upstream will not "
+                "auto-start after a restart unless that env var is unset or "
+                "updated to include it.")
+        return entry
+
+    @app.delete("/admin/external-upstreams/{name}")
+    async def delete_external_upstream(
+        name: str,
+        authorization: str | None = Header(default=None),
+        workspace_identity: str | None = Header(default=None, alias="X-AW-Identity-Sub"),
+    ):
+        """Reverse everything the PUT above did: drop from mcp.custom.json,
+        drop from the allowlist (file + memory), delete any secret this
+        entry referenced that no other custom entry still needs, reload."""
+        _check_admin_auth(authorization, workspace_identity)
+        custom = config.load_custom_mcp_config()
+        if name not in custom["mcpServers"]:
+            return JSONResponse({"error": f"no external upstream named {name!r}"}, status_code=404)
+        spec = custom["mcpServers"].pop(name)
+        config.save_custom_mcp_config(custom)
+
+        gw_cfg = config.load_gateway_config()
+        upstreams_list = list(gw_cfg.get("upstreams") or [])
+        if name in upstreams_list:
+            upstreams_list.remove(name)
+            gw_cfg["upstreams"] = upstreams_list
+            config.save_gateway_config(gw_cfg)
+        if name in gateway.allow:
+            gateway.allow.remove(name)
+
+        deleted_refs = _spec_secret_refs(spec)
+        still_referenced: set[str] = set()
+        for other_spec in config.load_custom_mcp_config()["mcpServers"].values():
+            still_referenced |= _spec_secret_refs(other_spec)
+        for ref_name in deleted_refs - still_referenced:
+            config.delete_upstream_secret(ref_name)
+
+        result = await gateway.reload()
+        return {"ok": True, "reload": result}
+
     @app.post("/link-tokens")
     async def mint_link_token(request: Request, authorization: str | None = Header(default=None)):
         _check_auth(authorization)
