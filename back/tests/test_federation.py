@@ -83,6 +83,68 @@ async def test_federation_depth_cap_rejects_too_deep_chain():
         assert parent_gw.federation_chain == ["parent-b"]
 
 
+async def test_gateway_upstream_allowed_tools_scopes_the_pool():
+    """``allowed_tools`` narrows what a ``type: gateway`` upstream publishes
+    — the tool still exists on the leaf, but only names on the list get a
+    route on the parent."""
+    async with running_gateway(19305, "leaf-c") as (leaf_gw, leaf_url, leaf_token):
+        await leaf_gw.start()
+
+        # The leaf gateway's own aggregation already prefixes the raw
+        # "echo" tool as "example_echo__echo" by the time it reaches
+        # tools/list — allowed_tools matches against THAT published name,
+        # not the underlying stdio server's bare tool name.
+        parent_gw = Gateway(["leaf"], gateway_id="parent-c")
+        with mcp_servers_override({
+            "leaf": {"type": "gateway", "url": f"{leaf_url}/mcp", "token": leaf_token,
+                     "allowed_tools": ["example_echo__echo"]},
+        }):
+            await parent_gw.start()
+
+        assert "leaf" in parent_gw.upstreams
+        assert "leaf__example_echo__echo" in parent_gw.routes
+        assert {t["name"] for t in parent_gw.upstreams["leaf"].tools} == {"example_echo__echo"}
+
+
+async def test_probe_federated_gateway_returns_tools_without_registering_an_upstream():
+    """``Gateway.probe_federated_gateway`` (the admin UI's tool picker) must
+    report exactly what a real ``type: gateway`` connect would see, but
+    never touch ``upstreams``/``routes`` — it's a preview, not a save."""
+    async with running_gateway(19307, "leaf-e") as (leaf_gw, leaf_url, leaf_token):
+        await leaf_gw.start()
+
+        parent_gw = Gateway([], gateway_id="parent-e")
+        result = await parent_gw.probe_federated_gateway(f"{leaf_url}/mcp", leaf_token)
+
+        assert result["gateway_id"] == "leaf-e"
+        # The leaf gateway in this suite also auto-loads whatever real apps
+        # happen to be scanned on the machine running the tests (see the
+        # zero-isolation note on `running_gateway` above) — assert presence,
+        # not the full set, the same way the allowed_tools tests above do.
+        assert "example_echo__echo" in {t["name"] for t in result["tools"]}
+        assert parent_gw.upstreams == {}
+        assert parent_gw.routes == {}
+
+
+async def test_gateway_upstream_allowed_tools_excluding_everything_fails_to_start():
+    """An ``allowed_tools`` list that matches nothing on the remote must
+    behave exactly like any other zero-tool upstream start (parked/failed,
+    not silently "connected with nothing to call") — see
+    ``Gateway._start_one``'s zero-tools guard."""
+    async with running_gateway(19306, "leaf-d") as (leaf_gw, leaf_url, leaf_token):
+        await leaf_gw.start()
+
+        parent_gw = Gateway(["leaf"], gateway_id="parent-d")
+        with mcp_servers_override({
+            "leaf": {"type": "gateway", "url": f"{leaf_url}/mcp", "token": leaf_token,
+                     "allowed_tools": ["does-not-exist-on-the-remote"]},
+        }):
+            await parent_gw.start()
+
+        assert "leaf" not in parent_gw.upstreams
+        assert not any(route.startswith("leaf__") for route in parent_gw.routes)
+
+
 async def test_federation_cycle_is_rejected():
     """A gateway (B) that already has our own id (A) in its ancestor chain
     must be refused as an upstream — federating it back in would close a

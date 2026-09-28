@@ -568,6 +568,15 @@ class GatewayUpstream(HttpUpstream):
       loop).
     * **depth cap** — refuse if federating would make the chain longer
       than ``max_federation_depth``.
+
+    An optional ``spec["allowed_tools"]`` (list of tool names) narrows the
+    aggregated pool down from "every tool the remote publishes" to an
+    explicit allowlist — the peer's ``tools/list`` is still fetched in full
+    (needed for the picker UI to offer names), but anything not in the list
+    is dropped from ``self.tools`` before ``Gateway._start_one`` builds
+    routes from it, so an excluded tool is never routable, not merely
+    hidden from ``tools/list``. Absent/``None`` keeps the old
+    everything-through behaviour, so existing configs are unaffected.
     """
 
     def __init__(self, name: str, spec: dict, own_gateway_id: str, max_depth: int):
@@ -585,6 +594,8 @@ class GatewayUpstream(HttpUpstream):
         self.max_depth = max_depth
         self.remote_gateway_id: str | None = None
         self.remote_chain: list[str] = []
+        allowed = original_spec.get("allowed_tools")
+        self.allowed_tools: set[str] | None = set(allowed) if allowed is not None else None
 
     def _client_headers(self) -> dict[str, str]:
         # Every request this class sends IS a gateway-to-gateway hop by
@@ -629,6 +640,14 @@ class GatewayUpstream(HttpUpstream):
         log.info("gateway upstream %s initialized: %s", self.name,
                  init.get("result", {}).get("serverInfo", {}).get("name", "?"))
         listed = await self._post({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"})
-        self.tools = listed.get("result", {}).get("tools", [])
-        log.info("gateway upstream %s — %d federated tools (remote id=%s, chain depth=%d)",
-                 self.name, len(self.tools), self.remote_gateway_id, len(self.remote_chain))
+        remote_tools = listed.get("result", {}).get("tools", [])
+        if self.allowed_tools is not None:
+            self.tools = [t for t in remote_tools if t.get("name") in self.allowed_tools]
+            log.info("gateway upstream %s — %d/%d federated tools published (scoped by allowed_tools, "
+                     "remote id=%s, chain depth=%d)",
+                     self.name, len(self.tools), len(remote_tools), self.remote_gateway_id,
+                     len(self.remote_chain))
+        else:
+            self.tools = remote_tools
+            log.info("gateway upstream %s — %d federated tools (remote id=%s, chain depth=%d)",
+                     self.name, len(self.tools), self.remote_gateway_id, len(self.remote_chain))

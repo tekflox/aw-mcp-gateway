@@ -163,6 +163,32 @@ class Gateway:
             self._add_route(name, tool)
         return None
 
+    async def probe_federated_gateway(self, url: str, token: str | None) -> dict:
+        """Connect once to a candidate ``type: gateway`` peer and report what
+        it would publish — full ``tools/list``, plus the same cycle/depth
+        checks a real save would apply — WITHOUT registering it as a running
+        upstream. Powers the admin UI's tool picker: point at a peer, see its
+        tools, choose which ones to allow via ``allowed_tools``, then save.
+
+        Raises on any failure (unreachable, bad token, cycle, depth) — the
+        caller turns that into an HTTP error for the UI to display; there is
+        no partial/best-effort result.
+        """
+        spec: dict = {"type": "gateway", "url": url}
+        if token:
+            spec["token"] = token
+        probe = GatewayUpstream("__probe__", spec, self.gateway_id, self.max_federation_depth)
+        try:
+            await probe.start()
+            return {
+                "gateway_id": probe.remote_gateway_id,
+                "federation_chain": probe.remote_chain,
+                "tools": [{"name": t.get("name"), "description": t.get("description")}
+                          for t in probe.tools],
+            }
+        finally:
+            await probe.stop()
+
     def _drop_local_routes(self, server: str) -> None:
         """Remove every published route/tool that dispatches to `server` —
         the local-upstream counterpart of _withdraw_remote(), used by
@@ -813,6 +839,33 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
         _check_admin_auth(authorization, workspace_identity)
         return {"upstreams": _external_upstreams_payload()}
 
+    @app.post("/admin/external-upstreams/probe-gateway")
+    async def probe_gateway_upstream(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        workspace_identity: str | None = Header(default=None, alias="X-AW-Identity-Sub"),
+    ):
+        """Preview what a candidate ``type: gateway`` upstream would publish,
+        before it's saved anywhere — lets the UI's tool picker show real tool
+        names (and surface a bad URL/token/cycle/depth error) up front,
+        instead of the operator finding out only after committing to an
+        all-or-nothing save.
+
+        Body: ``{"url": "...", "token": "..."}`` — ``token`` optional (some
+        peers run with ``auth_required: false`` and no bearer check at all).
+        Nothing here is persisted; this never touches ``mcp.custom.json``.
+        """
+        _check_admin_auth(authorization, workspace_identity)
+        body = await request.json()
+        if not isinstance(body, dict) or not body.get("url"):
+            return JSONResponse({"error": "'url' is required"}, status_code=400)
+        try:
+            return await gateway.probe_federated_gateway(body["url"], body.get("token"))
+        except (FederationCycleError, FederationDepthExceeded) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except Exception as exc:
+            return JSONResponse({"error": f"could not reach {body['url']!r}: {exc}"}, status_code=502)
+
     @app.put("/admin/external-upstreams/{name}")
     async def put_external_upstream(
         name: str, request: Request,
@@ -841,13 +894,22 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
         if not isinstance(spec, dict):
             return JSONResponse({"error": "'spec' must be an object"}, status_code=400)
         kind = spec.get("type", "stdio")
-        if kind not in ("stdio", "http"):
+        if kind not in ("stdio", "http", "gateway"):
             return JSONResponse(
-                {"error": f"unsupported type {kind!r} — must be 'stdio' or 'http'"}, status_code=400)
+                {"error": f"unsupported type {kind!r} — must be 'stdio', 'http' or 'gateway'"},
+                status_code=400)
         if kind == "stdio" and not spec.get("command"):
             return JSONResponse({"error": "a stdio upstream needs 'command'"}, status_code=400)
-        if kind == "http" and not spec.get("url"):
-            return JSONResponse({"error": "an http upstream needs 'url'"}, status_code=400)
+        if kind in ("http", "gateway") and not spec.get("url"):
+            return JSONResponse({"error": f"an {kind} upstream needs 'url'"}, status_code=400)
+        if kind == "gateway":
+            allowed_tools = spec.get("allowed_tools")
+            if allowed_tools is not None and (
+                not isinstance(allowed_tools, list)
+                or not all(isinstance(t, str) for t in allowed_tools)
+            ):
+                return JSONResponse(
+                    {"error": "'allowed_tools' must be a list of tool name strings"}, status_code=400)
 
         scanned, _sources = config.scan_app_mcp_servers()
         if name in scanned:

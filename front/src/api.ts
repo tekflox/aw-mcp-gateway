@@ -14,13 +14,31 @@ export interface HealthResponse {
 // env/header values may hold a "${secret:<name>}" reference instead of a
 // literal — see back/gateway/config.py's resolve_secret_refs().
 export interface ExternalUpstreamSpec {
-  type: "stdio" | "http";
+  type: "stdio" | "http" | "gateway";
   command?: string;
   args?: string[];
   env?: Record<string, string>;
   url?: string;
   headers?: Record<string, string>;
   enabled?: boolean;
+  // "gateway" only — the peer's bearer token, and the subset of ITS tools
+  // to aggregate into this gateway. Absent allowed_tools means "everything
+  // the peer publishes" (the old behaviour); an explicit list is how a
+  // federation to another workspace's gateway stays scoped to what was
+  // actually picked in the UI instead of pulling that peer's whole pool.
+  token?: string;
+  allowed_tools?: string[];
+}
+
+export interface GatewayProbeTool {
+  name: string;
+  description?: string;
+}
+
+export interface GatewayProbeResult {
+  gateway_id: string;
+  federation_chain: string[];
+  tools: GatewayProbeTool[];
 }
 
 export interface ExternalUpstreamStatus {
@@ -121,6 +139,19 @@ export async function putExternalUpstream(
     body: JSON.stringify({ spec, secrets }),
   });
   if (!res.ok) throw new Error(await _errorMessage(res, `save external upstream failed: ${res.status}`));
+  return res.json();
+}
+
+// Preview what a candidate `type: gateway` peer would publish — nothing is
+// saved by this call. Powers the tool picker: enter URL+token, fetch the
+// real tool names, THEN choose which ones to allow before saving.
+export async function probeGatewayUpstream(url: string, token?: string): Promise<GatewayProbeResult> {
+  const res = await fetch(`${BASE}/admin/external-upstreams/probe-gateway`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, token }),
+  });
+  if (!res.ok) throw new Error(await _errorMessage(res, `probe gateway failed: ${res.status}`));
   return res.json();
 }
 

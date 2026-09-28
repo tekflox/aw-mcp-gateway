@@ -85,7 +85,24 @@ def test_put_rejects_unsupported_type(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch)
     with TestClient(app) as client:
         res = client.put("/admin/external-upstreams/x", headers=ADMIN,
-                          json={"spec": {"type": "gateway", "url": "http://x"}})
+                          json={"spec": {"type": "carrier-pigeon", "url": "http://x"}})
+    assert res.status_code == 400
+
+
+def test_put_rejects_gateway_without_url(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        res = client.put("/admin/external-upstreams/x", headers=ADMIN,
+                          json={"spec": {"type": "gateway"}})
+    assert res.status_code == 400
+
+
+def test_put_rejects_gateway_allowed_tools_that_is_not_a_string_list(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        res = client.put("/admin/external-upstreams/x", headers=ADMIN,
+                          json={"spec": {"type": "gateway", "url": "http://x/mcp",
+                                         "allowed_tools": "not-a-list"}})
     assert res.status_code == 400
 
 
@@ -210,6 +227,82 @@ def test_secret_value_never_appears_in_any_get_response_or_written_config_files(
     assert secret_value not in (tmp_path / "mcp.custom.json").read_text()
     # It DOES live in the write-only side store — that's the point of it.
     assert secret_value in (tmp_path / "upstream_secrets.json").read_text()
+
+
+# ── PUT: gateway-type upstreams (generic federation, allowed_tools) ───────
+#
+# A real end-to-end "does a live peer's tools actually get pulled and
+# scoped by allowed_tools" is already covered by test_federation.py (which
+# runs a real second gateway over real HTTP). The tests below stay
+# synchronous and point at an unreachable URL on purpose — mixing a live
+# async uvicorn peer with starlette's sync TestClient (its own blocking
+# portal/event loop) inside one async test deadlocked (a caller_context
+# resource ending up bound across two different event loops); exercising
+# the endpoint's own wiring/validation doesn't need a real peer to do that.
+
+def test_put_accepts_gateway_type_and_attempts_a_real_start(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        res = client.put("/admin/external-upstreams/leaf", headers=ADMIN, json={"spec": {
+            "type": "gateway", "url": "http://127.0.0.1:1/mcp", "token": "x",
+            "allowed_tools": ["some_tool"],
+        }})
+
+    # Validation passed (kind="gateway" is accepted) and it genuinely tried
+    # to connect — port 1 refusing the connection proves this isn't a
+    # config-shape rejection, it's a real (failed) start attempt.
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "error"
+    assert body["spec"]["allowed_tools"] == ["some_tool"]
+
+
+def test_put_gateway_upstream_secret_token_never_leaks_in_any_response(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch)
+    secret_value = "sekrit-peer-token-9f8e7d"
+    with TestClient(app) as client:
+        put_res = client.put("/admin/external-upstreams/leaf", headers=ADMIN, json={
+            "spec": {"type": "gateway", "url": "http://127.0.0.1:1/mcp",
+                     "token": "${secret:leaf-token}", "allowed_tools": []},
+            "secrets": {"leaf-token": secret_value},
+        })
+        get_res = client.get("/admin/external-upstreams", headers=ADMIN)
+    assert secret_value not in put_res.text
+    assert secret_value not in get_res.text
+    assert config.resolve_secret_refs({"t": "${secret:leaf-token}"}) == {"t": secret_value}
+
+
+# ── Probe: preview a candidate gateway's tools before saving anything ─────
+
+def test_probe_gateway_requires_admin_auth(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        res = client.post("/admin/external-upstreams/probe-gateway", json={"url": "http://x/mcp"})
+    assert res.status_code == 401
+
+
+def test_probe_gateway_requires_url(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        res = client.post("/admin/external-upstreams/probe-gateway", headers=ADMIN, json={})
+    assert res.status_code == 400
+
+
+def test_probe_gateway_reports_a_clean_error_for_an_unreachable_url(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        res = client.post("/admin/external-upstreams/probe-gateway", headers=ADMIN,
+                           json={"url": "http://127.0.0.1:1/mcp", "token": "x"})
+    assert res.status_code == 502
+
+
+def test_probe_gateway_does_not_persist_anything(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        client.post("/admin/external-upstreams/probe-gateway", headers=ADMIN,
+                     json={"url": "http://127.0.0.1:1/mcp", "token": "x"})
+        listed = client.get("/admin/external-upstreams", headers=ADMIN).json()["upstreams"]
+    assert listed == []
 
 
 # ── DELETE ───────────────────────────────────────────────────────────────

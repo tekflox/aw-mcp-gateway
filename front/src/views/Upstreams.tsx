@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   getHealth, type HealthResponse,
-  listExternalUpstreams, putExternalUpstream, deleteExternalUpstream,
-  type ExternalUpstreamStatus, type ExternalUpstreamSpec,
+  listExternalUpstreams, putExternalUpstream, deleteExternalUpstream, probeGatewayUpstream,
+  type ExternalUpstreamStatus, type ExternalUpstreamSpec, type GatewayProbeTool,
 } from "../api";
 
 const SECRET_REF_RE = /^\$\{secret:(.+)\}$/;
@@ -44,13 +44,24 @@ function ExternalUpstreams() {
   const [formOpen, setFormOpen] = useState(false);
   const [editingName, setEditingName] = useState<string | null>(null); // null = adding new
   const [name, setName] = useState("");
-  const [type, setType] = useState<"stdio" | "http">("stdio");
+  const [type, setType] = useState<"stdio" | "http" | "gateway">("stdio");
   const [command, setCommand] = useState("");
   const [args, setArgs] = useState("");
   const [url, setUrl] = useState("");
   const [rows, setRows] = useState<KvRow[]>([]);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+
+  // "gateway" type only — token is a single secret field (not a header/env
+  // row), and the tool picker needs to know what the peer WOULD publish
+  // before anything is saved.
+  const [gwToken, setGwToken] = useState("");
+  const [gwExistingTokenRef, setGwExistingTokenRef] = useState<string | null>(null);
+  const [gwTokenReplacing, setGwTokenReplacing] = useState(false);
+  const [gwAvailableTools, setGwAvailableTools] = useState<GatewayProbeTool[] | null>(null);
+  const [gwAllowedTools, setGwAllowedTools] = useState<Set<string>>(new Set());
+  const [gwProbing, setGwProbing] = useState(false);
+  const [gwProbeError, setGwProbeError] = useState<string | null>(null);
 
   useEffect(() => {
     refreshExternal();
@@ -74,6 +85,13 @@ function ExternalUpstreams() {
     setUrl("");
     setRows([]);
     setFormError(null);
+    setGwToken("");
+    setGwExistingTokenRef(null);
+    setGwTokenReplacing(false);
+    setGwAvailableTools(null);
+    setGwAllowedTools(new Set());
+    setGwProbing(false);
+    setGwProbeError(null);
   }
 
   function openAddForm() {
@@ -89,8 +107,53 @@ function ExternalUpstreams() {
     setArgs((entry.spec.args ?? []).join(" "));
     setUrl(entry.spec.url ?? "");
     setRows(rowsFromSpec(entry.spec));
+    setGwToken("");
+    setGwExistingTokenRef(entry.spec.type === "gateway" ? entry.spec.token ?? null : null);
+    setGwTokenReplacing(false);
+    const allowed = entry.spec.allowed_tools ?? [];
+    setGwAllowedTools(new Set(allowed));
+    // Seed the picker from what's already allow-listed, so the checklist
+    // isn't empty just because the operator hasn't re-probed yet — "Fetch
+    // tools" below replaces this with the peer's live tools/list.
+    setGwAvailableTools(entry.spec.type === "gateway" ? allowed.map((n) => ({ name: n })) : null);
+    setGwProbing(false);
+    setGwProbeError(null);
     setFormError(null);
     setFormOpen(true);
+  }
+
+  async function fetchGatewayTools() {
+    setGwProbeError(null);
+    if (!url.trim()) {
+      setGwProbeError("enter a URL first");
+      return;
+    }
+    const tokenForProbe = gwTokenReplacing || !gwExistingTokenRef ? gwToken : null;
+    if (!tokenForProbe && !gwExistingTokenRef) {
+      setGwProbeError("enter a token first (or click \"Replace token\" to re-use one you're retyping)");
+      return;
+    }
+    setGwProbing(true);
+    try {
+      const result = await probeGatewayUpstream(url.trim(), tokenForProbe ?? undefined);
+      setGwAvailableTools(result.tools);
+      // Drop selections for tools the peer no longer publishes; keep the rest.
+      const stillThere = new Set(result.tools.map((t) => t.name));
+      setGwAllowedTools((prev) => new Set([...prev].filter((n) => stillThere.has(n))));
+    } catch (e) {
+      setGwProbeError(String(e));
+    } finally {
+      setGwProbing(false);
+    }
+  }
+
+  function toggleGwTool(toolName: string) {
+    setGwAllowedTools((prev) => {
+      const next = new Set(prev);
+      if (next.has(toolName)) next.delete(toolName);
+      else next.add(toolName);
+      return next;
+    });
   }
 
   function addRow() {
@@ -113,6 +176,7 @@ function ExternalUpstreams() {
       return;
     }
     const spec: ExternalUpstreamSpec = { type };
+    const secrets: Record<string, string> = {};
     if (type === "stdio") {
       if (!command.trim()) {
         setFormError("command is required for a stdio upstream");
@@ -121,6 +185,26 @@ function ExternalUpstreams() {
       spec.command = command.trim();
       const argList = args.split(/\s+/).map((a) => a.trim()).filter(Boolean);
       if (argList.length) spec.args = argList;
+    } else if (type === "gateway") {
+      if (!url.trim()) {
+        setFormError("url is required for a gateway upstream");
+        return;
+      }
+      spec.url = url.trim();
+      if (gwExistingTokenRef && !gwTokenReplacing) {
+        spec.token = gwExistingTokenRef; // untouched — no new secret write
+      } else if (gwToken) {
+        const secretName = `${cleanName}-token`.replace(/[^a-zA-Z0-9_-]/g, "-");
+        secrets[secretName] = gwToken;
+        spec.token = `\${secret:${secretName}}`;
+      } else if (!gwExistingTokenRef) {
+        setFormError("enter the peer gateway's bearer token");
+        return;
+      }
+      // Always explicit, never omitted — an empty selection means "publish
+      // nothing" (safe, if surprising) rather than silently falling back to
+      // the old all-or-nothing "every tool the peer has" behaviour.
+      spec.allowed_tools = [...gwAllowedTools];
     } else {
       if (!url.trim()) {
         setFormError("url is required for an http upstream");
@@ -130,7 +214,6 @@ function ExternalUpstreams() {
     }
 
     const kv: Record<string, string> = {};
-    const secrets: Record<string, string> = {};
     for (const row of rows) {
       const key = row.key.trim();
       if (!key) continue;
@@ -213,7 +296,12 @@ function ExternalUpstreams() {
               <td>{entry.name}</td>
               <td>{entry.spec.type}</td>
               <td>
-                <code>{entry.spec.type === "http" ? entry.spec.url : entry.spec.command}</code>
+                <code>{entry.spec.type === "stdio" ? entry.spec.command : entry.spec.url}</code>
+                {entry.spec.type === "gateway" && (
+                  <div style={{ opacity: 0.7, fontSize: "0.85em" }}>
+                    {(entry.spec.allowed_tools ?? []).length} tool(s) allowed
+                  </div>
+                )}
               </td>
               <td>
                 {entry.status}
@@ -250,11 +338,12 @@ function ExternalUpstreams() {
               Type{" "}
               <select
                 value={type}
-                onChange={(e) => setType(e.target.value as "stdio" | "http")}
+                onChange={(e) => setType(e.target.value as "stdio" | "http" | "gateway")}
                 disabled={!!editingName}
               >
                 <option value="stdio">stdio</option>
                 <option value="http">http</option>
+                <option value="gateway">gateway (federate another aw-mcp-gateway)</option>
               </select>
             </label>
           </div>
@@ -278,6 +367,68 @@ function ExternalUpstreams() {
                 </label>
               </div>
             </>
+          ) : type === "gateway" ? (
+            <>
+              <div>
+                <label>
+                  URL{" "}
+                  <input
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    placeholder="https://api.<slug>.workspace.aw.tekflox.com/api/apps/mcp-gateway/mcp"
+                    style={{ width: 420 }}
+                  />
+                </label>
+              </div>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
+                <label>
+                  Token{" "}
+                  {gwExistingTokenRef && !gwTokenReplacing ? (
+                    <>
+                      <code>{gwExistingTokenRef}</code>{" "}
+                      <button onClick={() => setGwTokenReplacing(true)}>Replace token</button>
+                    </>
+                  ) : (
+                    <input
+                      type="password"
+                      value={gwToken}
+                      onChange={(e) => setGwToken(e.target.value)}
+                      style={{ width: 260 }}
+                    />
+                  )}
+                </label>
+              </div>
+              <div style={{ marginBottom: 8 }}>
+                <button onClick={fetchGatewayTools} disabled={gwProbing}>
+                  {gwProbing ? "Fetching…" : "Fetch tools"}
+                </button>
+                {gwProbeError && <span style={{ color: "red", marginLeft: 8 }}>{gwProbeError}</span>}
+              </div>
+              <h5>
+                Tools to allow ({gwAllowedTools.size}
+                {gwAvailableTools ? `/${gwAvailableTools.length}` : ""})
+              </h5>
+              <p style={{ opacity: 0.8, fontSize: "0.9em" }}>
+                Nothing is aggregated by default — only the tools checked here get a route on this
+                gateway. The peer's other tools (browser, kb, other apps it runs) are never pulled in.
+              </p>
+              <div style={{ maxHeight: 240, overflowY: "auto", border: "1px solid #262a33", padding: 8 }}>
+                {(gwAvailableTools ?? []).map((t) => (
+                  <div key={t.name}>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={gwAllowedTools.has(t.name)}
+                        onChange={() => toggleGwTool(t.name)}
+                      />{" "}
+                      <code>{t.name}</code>
+                      {t.description ? ` — ${t.description}` : ""}
+                    </label>
+                  </div>
+                ))}
+                {!gwAvailableTools?.length && <p>Click "Fetch tools" to list what the peer publishes.</p>}
+              </div>
+            </>
           ) : (
             <div>
               <label>
@@ -292,8 +443,8 @@ function ExternalUpstreams() {
             </div>
           )}
 
-          <h5>{kvLabel}</h5>
-          {rows.map((row) => (
+          {type !== "gateway" && <h5>{kvLabel}</h5>}
+          {type !== "gateway" && rows.map((row) => (
             <div key={row.id} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
               <input
                 placeholder="key"
@@ -330,7 +481,7 @@ function ExternalUpstreams() {
               <button onClick={() => removeRow(row.id)}>Remove</button>
             </div>
           ))}
-          <button onClick={addRow}>Add {addRowLabel}</button>
+          {type !== "gateway" && <button onClick={addRow}>Add {addRowLabel}</button>}
 
           {formError && <p style={{ color: "red" }}>{formError}</p>}
           <div style={{ marginTop: 8 }}>
@@ -389,8 +540,8 @@ export default function Upstreams() {
       <div className="card">
         <h3>Federated gateways ({"type: gateway"} upstreams)</h3>
         <p>
-          Other aw-mcp-gateway instances whose whole tool pool is aggregated into
-          this one — configured in <code>back/config/mcp.json</code>.
+          Other aw-mcp-gateway instances this one pulls tools from — add or edit one above (type
+          "gateway"), scoped to whichever tools you pick in the picker rather than that peer's whole pool.
         </p>
         <ul>
           {(health?.federated_gateways ?? []).map((name) => (
