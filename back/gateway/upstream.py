@@ -24,7 +24,7 @@ import os
 
 import httpx
 
-from . import caller_context, config, metrics
+from . import caller_context, config, config_gateway, metrics
 
 from .config import BASE_DIR
 
@@ -164,6 +164,27 @@ def _classify_call_failure(exc: Exception) -> tuple[str, bool]:
     if isinstance(exc, httpx.TimeoutException):
         return "timeout", False
     return "upstream_error", False
+
+
+def _wants_caller_run_id(upstream_name: str) -> bool:
+    """True only for upstreams that genuinely read ``_gateway_caller_run_id``
+    out of their tool arguments — agents-platform's own tools
+    (mark_as_planned/mark_flow_done/ask_human/register_callback). Reuses
+    ``ConfigGateway``'s existing ``agents_platform`` role allowlist (see
+    ``config_gateway.policy_upstreams``) rather than a second one, so a
+    deployment's ``policy_upstreams`` override in ``gateway.json`` governs
+    both consistently.
+
+    This used to be unconditional for every stdio upstream, which meant a
+    THIRD-PARTY stdio child that does its own strict schema validation
+    (``notion``'s ``npx @notionhq/notion-mcp-server``) got handed a field it
+    never asked for and rejected the whole call with 400 — breaking every
+    ``aw__notion__API-*`` tool call whenever the session had a caller run id
+    (degraded:mcp-gateway-notion-caller-id-leak, a recurrence of a 2026-07
+    bug where the same leak carried an earlier field name, ``_aw_context``).
+    """
+    return upstream_name in config_gateway.policy_upstreams(
+        config.policy_upstream_overrides()).get("agents_platform", set())
 
 
 def public_name(server: str, tool: str) -> str:
@@ -322,8 +343,12 @@ class Upstream:
         # because this Upstream is one persistent child shared across all of
         # them (unlike a per-run docker CLI agent, os.environ.AW_RUN_ID here
         # is fixed at spawn and not caller-specific).
+        #
+        # Gated by _wants_caller_run_id(): see its docstring for why this
+        # must NOT be unconditional for every stdio upstream.
         caller_run_id = caller_context.current().get("x-aw-caller-run-id")
-        if caller_run_id and "_gateway_caller_run_id" not in arguments:
+        if (caller_run_id and _wants_caller_run_id(self.name)
+                and "_gateway_caller_run_id" not in arguments):
             arguments = {**arguments, "_gateway_caller_run_id": caller_run_id}
 
         # One child process serves EVERY concurrent caller, so the key this
