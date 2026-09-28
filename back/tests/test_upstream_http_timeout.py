@@ -32,6 +32,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from gateway.upstream import (
+    HANDSHAKE_HTTP_TIMEOUT,
     HEALTH_CHECK_TIMEOUT,
     GatewayUpstream,
     HttpUpstream,
@@ -93,6 +94,19 @@ def test_upstream_http_timeout_keeps_connect_write_pool_tight_but_read_generous(
     assert UPSTREAM_HTTP_TIMEOUT.write == 30.0
     assert UPSTREAM_HTTP_TIMEOUT.pool == 10.0
     assert UPSTREAM_HTTP_TIMEOUT.read == 600.0
+
+
+def test_handshake_http_timeout_read_is_short_not_the_600s_call_tool_budget():
+    """The other half of the fix: a startup handshake has no reason to
+    inherit call_tool's 600s read budget — connect/write/pool still match
+    UPSTREAM_HTTP_TIMEOUT (a dead upstream fails fast the same way either
+    way), but read is HANDSHAKE_TIMEOUT_SECONDS so a hung `initialize`
+    doesn't stall Gateway.start()'s sequential await for up to 10 minutes."""
+    assert HANDSHAKE_HTTP_TIMEOUT.connect == UPSTREAM_HTTP_TIMEOUT.connect
+    assert HANDSHAKE_HTTP_TIMEOUT.write == UPSTREAM_HTTP_TIMEOUT.write
+    assert HANDSHAKE_HTTP_TIMEOUT.pool == UPSTREAM_HTTP_TIMEOUT.pool
+    assert HANDSHAKE_HTTP_TIMEOUT.read < UPSTREAM_HTTP_TIMEOUT.read
+    assert HANDSHAKE_HTTP_TIMEOUT.read <= 30.0
 
 
 async def test_http_upstream_start_constructs_client_with_the_shared_timeout():
@@ -270,3 +284,68 @@ async def test_health_check_does_not_inherit_the_600s_read_budget_on_a_real_hang
             await up.stop()
 
     assert elapsed < 2.0  # bounded by HEALTH_CHECK_TIMEOUT (0.3s), nowhere near the 5s hang or 600s read
+
+
+def _hanging_initialize_app() -> FastAPI:
+    """An upstream that accepts the connection but never answers
+    `initialize` — the exact 2026-09-03 incident (see HANDSHAKE_TIMEOUT_SECONDS'
+    docstring), reached over HTTP instead of stdio."""
+    app = FastAPI()
+
+    @app.post("/mcp")
+    async def handle(request: Request):
+        body = await request.json()
+        if body.get("method") == "initialize":
+            await asyncio.sleep(5.0)  # client gives up long before this; lets uvicorn shut down cleanly
+        return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"), "result": {}})
+
+    return app
+
+
+async def test_http_upstream_start_does_not_inherit_the_600s_read_budget_on_a_hanging_handshake(monkeypatch):
+    """End-to-end against a real socket: an upstream whose `initialize`
+    never answers must fail start() within HANDSHAKE_HTTP_TIMEOUT, not
+    UPSTREAM_HTTP_TIMEOUT's read=600.0 — before this fix, `initialize` went
+    through `_post()` with no override and inherited the client default,
+    so this exact scenario could hang Gateway.start()'s sequential await
+    for up to 10 minutes. Shrunk only so the test doesn't itself take
+    several seconds; the hang on the server side is real, not simulated."""
+    monkeypatch.setattr(
+        "gateway.upstream.HANDSHAKE_HTTP_TIMEOUT",
+        httpx.Timeout(connect=0.2, read=0.3, write=0.2, pool=0.2),
+    )
+    async with running_app(_hanging_initialize_app(), 19408) as base_url:
+        up = HttpUpstream("svc", {"url": f"{base_url}/mcp"})
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        with pytest.raises(httpx.TimeoutException):
+            await up.start()
+        elapsed = loop.time() - start
+
+    assert elapsed < 2.0  # bounded by HANDSHAKE_HTTP_TIMEOUT (0.3s), nowhere near 600s read
+
+
+async def test_gateway_upstream_healthz_probe_does_not_inherit_the_600s_read_budget(monkeypatch):
+    """Same failure mode, one layer up: GatewayUpstream.start()'s /healthz
+    GET is also part of the sequential-await handshake Gateway.start()
+    waits on, so it must fail fast too rather than inheriting the client's
+    generous call_tool budget."""
+    monkeypatch.setattr(
+        "gateway.upstream.HANDSHAKE_HTTP_TIMEOUT",
+        httpx.Timeout(connect=0.2, read=0.3, write=0.2, pool=0.2),
+    )
+    app = FastAPI()
+
+    @app.get("/healthz")
+    async def healthz():
+        await asyncio.sleep(5.0)  # client gives up long before this; lets uvicorn shut down cleanly
+
+    async with running_app(app, 19409) as base_url:
+        up = GatewayUpstream("leaf", {"url": f"{base_url}/mcp"}, "own-id", 6)
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        with pytest.raises(httpx.TimeoutException):
+            await up.start()
+        elapsed = loop.time() - start
+
+    assert elapsed < 2.0  # bounded by HANDSHAKE_HTTP_TIMEOUT (0.3s), nowhere near 600s read

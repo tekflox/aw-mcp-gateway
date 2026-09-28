@@ -38,8 +38,8 @@ DEFAULT_PROTOCOL = "2024-11-05"
 #: playwright` launch, needing to install browsers) blocked every upstream
 #: after it from ever starting, which meant the FastAPI lifespan never
 #: finished and the whole gateway never bound its port ("connection
-#: refused" workspace-wide, 2026-09-03). Matches the timeout HttpUpstream
-#: already applies to its own handshake (httpx.AsyncClient(timeout=30.0)) —
+#: refused" workspace-wide, 2026-09-03). Matches HANDSHAKE_HTTP_TIMEOUT
+#: below, HttpUpstream's own equivalent budget for the same failure mode —
 #: stdio just never got the same treatment.
 HANDSHAKE_TIMEOUT_SECONDS = 30.0
 
@@ -60,7 +60,31 @@ HANDSHAKE_TIMEOUT_SECONDS = 30.0
 #: eventually-successful case. Same shape as agents-platform-multitenant's
 #: test_telegram_upload_download_retry.py fix for an analogous scalar-
 #: timeout bug on a Telegram download leg.
+#:
+#: This is the CLIENT DEFAULT, applied to every call that doesn't pass its
+#: own ``timeout=`` override to ``_post``/``._client.get`` — which used to
+#: include the handshake itself (``_initialize_with_connect_retry`` and the
+#: ``tools/list`` call in ``start()``, plus ``GatewayUpstream``'s ``/healthz``
+#: probe). An upstream that accepts the TCP connection but then never answers
+#: initialize inherited the full read=600.0 budget there too, so it could
+#: hang ``start()`` for up to 10 minutes — Gateway.start() still awaits every
+#: upstream SEQUENTIALLY, so that is the exact 2026-09-03 incident above,
+#: just reached over HTTP instead of stdio. See HANDSHAKE_HTTP_TIMEOUT, which
+#: every handshake call now passes explicitly instead of falling through to
+#: this one.
 UPSTREAM_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
+
+#: The override the handshake calls above pass explicitly — connect/write/
+#: pool match UPSTREAM_HTTP_TIMEOUT (a dead upstream still fails fast the
+#: same way), but read is HANDSHAKE_TIMEOUT_SECONDS, not 600s: a handshake
+#: that hasn't answered in 30s is exactly the zombie HEALTH_CHECK_TIMEOUT
+#: exists to catch below, and Gateway.start()'s sequential await means every
+#: OTHER upstream configured after this one pays for however long it hangs.
+#: Once started, the same upstream's call_tool() reverts to the generous
+#: UPSTREAM_HTTP_TIMEOUT — a slow approval-gated tool is a completely
+#: different risk profile from a connection that never got past hello.
+HANDSHAKE_HTTP_TIMEOUT = httpx.Timeout(
+    connect=10.0, read=HANDSHAKE_TIMEOUT_SECONDS, write=30.0, pool=10.0)
 
 #: HttpUpstream.health_check() used to make its probe POST through ``_post``
 #: with no timeout override, so it inherited UPSTREAM_HTTP_TIMEOUT's full
@@ -431,7 +455,7 @@ class HttpUpstream:
                     "jsonrpc": "2.0", "id": "init", "method": "initialize",
                     "params": {"protocolVersion": DEFAULT_PROTOCOL,
                                "capabilities": {}, "clientInfo": {"name": "aw-mcp-gateway", "version": "1.0.0"}}
-                })
+                }, timeout=HANDSHAKE_HTTP_TIMEOUT)
             except (httpx.ConnectError, httpx.ConnectTimeout):
                 if attempt >= START_CONNECT_MAX_ATTEMPTS:
                     raise
@@ -454,7 +478,11 @@ class HttpUpstream:
         init = await self._initialize_with_connect_retry()
         log.info("http upstream %s initialized: %s", self.name,
                  init.get("result", {}).get("serverInfo", {}).get("name", "?"))
-        listed = await self._post({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"})
+        # HANDSHAKE_HTTP_TIMEOUT, not the client default: still part of the
+        # handshake Gateway.start() waits on sequentially, same reasoning as
+        # the initialize call above.
+        listed = await self._post({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"},
+                                  timeout=HANDSHAKE_HTTP_TIMEOUT)
         self.tools = listed.get("result", {}).get("tools", [])
         log.info("http upstream %s — %d tools", self.name, len(self.tools))
 
@@ -606,16 +634,21 @@ class GatewayUpstream(HttpUpstream):
         return headers
 
     async def start(self) -> None:
-        # Same reasoning as HttpUpstream.start(): don't let an unfollowed
-        # redirect on /healthz or the handshake sink an otherwise-reachable
-        # federated gateway. This client also carries every proxied
-        # call_tool() (inherited, unmodified) for this remote gateway, so it
-        # needs the same generous read budget HttpUpstream gets — an
-        # approval-gated tool one hop further into a federated gateway hits
-        # the identical 30s-read problem otherwise. Connect stays short,
-        # which still covers "the remote gateway never starts".
+        # This client also carries every proxied call_tool() (inherited,
+        # unmodified) for this remote gateway, so it defaults to
+        # UPSTREAM_HTTP_TIMEOUT's generous read budget — an approval-gated
+        # tool one hop further into a federated gateway hits the identical
+        # slow-call problem HttpUpstream.call_tool() was fixed for. The
+        # /healthz probe and the handshake below are a different risk: they
+        # are what Gateway.start() waits on SEQUENTIALLY, so each passes
+        # HANDSHAKE_HTTP_TIMEOUT explicitly instead of inheriting that
+        # 600s-read default — a remote that accepts the connection but never
+        # answers must fail fast, not stall every upstream configured after
+        # it. follow_redirects: don't let an unfollowed redirect on /healthz
+        # or the handshake sink an otherwise-reachable federated gateway.
         self._client = httpx.AsyncClient(timeout=UPSTREAM_HTTP_TIMEOUT, follow_redirects=True)
-        resp = await self._client.get(_healthz_url(self.url), headers=self._extra_headers)
+        resp = await self._client.get(_healthz_url(self.url), headers=self._extra_headers,
+                                      timeout=HANDSHAKE_HTTP_TIMEOUT)
         resp.raise_for_status()
         health = resp.json()
         self.remote_gateway_id = health.get("gateway_id")
@@ -631,15 +664,17 @@ class GatewayUpstream(HttpUpstream):
                 f"{self.max_depth} (remote chain depth {len(self.remote_chain)})")
 
         # Handshake + tools/list over the same client/session — identical
-        # dispatch to a plain HttpUpstream from here on.
+        # dispatch to a plain HttpUpstream from here on, including the
+        # explicit HANDSHAKE_HTTP_TIMEOUT override.
         init = await self._post({
             "jsonrpc": "2.0", "id": "init", "method": "initialize",
             "params": {"protocolVersion": DEFAULT_PROTOCOL,
                        "capabilities": {}, "clientInfo": {"name": "aw-mcp-gateway", "version": "1.0.0"}}
-        })
+        }, timeout=HANDSHAKE_HTTP_TIMEOUT)
         log.info("gateway upstream %s initialized: %s", self.name,
                  init.get("result", {}).get("serverInfo", {}).get("name", "?"))
-        listed = await self._post({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"})
+        listed = await self._post({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"},
+                                  timeout=HANDSHAKE_HTTP_TIMEOUT)
         remote_tools = listed.get("result", {}).get("tools", [])
         if self.allowed_tools is not None:
             self.tools = [t for t in remote_tools if t.get("name") in self.allowed_tools]
