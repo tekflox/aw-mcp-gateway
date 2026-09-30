@@ -106,6 +106,22 @@ def _scan_roots() -> list[Path]:
     return roots
 
 
+def app_version(app_dir: Path) -> str | None:
+    """``version`` out of an installed app's ``aw-app.json``, or ``None`` when
+    the manifest is missing, unreadable, or carries no usable version.
+
+    ``None`` is the "say nothing" answer on purpose: the caller then omits the
+    key entirely, leaving the emitted spec byte-identical to what it was
+    before versions were folded into upstream identity. A best-effort
+    placeholder ("unknown", "") would instead be a value that can *change*
+    once the manifest becomes readable, which is a spurious re-dial.
+    """
+    raw = _read_json(str(app_dir / "aw-app.json"), {}).get("version")
+    if raw is None or isinstance(raw, (dict, list)):
+        return None
+    return str(raw).strip() or None
+
+
 def scan_app_mcp_servers(scan_roots: list[Path] | None = None) -> tuple[dict, dict]:
     """Read ``mcp.json`` from each installed app folder.
 
@@ -113,6 +129,9 @@ def scan_app_mcp_servers(scan_roots: list[Path] | None = None) -> tuple[dict, di
     about the app file that provided it. Later app folders override earlier
     folders for the same server name; custom config overrides all scanned
     entries during final composition.
+
+    An upstream's identity here is **its spec plus its owning app's version**,
+    see the ``x_app_version`` injection below.
     """
     servers: dict = {}
     sources: dict = {}
@@ -129,8 +148,35 @@ def scan_app_mcp_servers(scan_roots: list[Path] | None = None) -> tuple[dict, di
                 continue
             if resolved in (final_path, custom_path) or not mcp_path.is_file():
                 continue
+            version = app_version(app_dir)
             for name, spec in _mcp_servers(_read_json(str(mcp_path), _empty_mcp())).items():
                 spec = dict(spec)
+                # Upstream identity = spec + the OWNING APP'S VERSION. An app
+                # update that adds or renames a tool without touching its
+                # mcp.json leaves the spec byte-identical, so
+                # ``Gateway.reload()``'s ``up.spec != new_specs[n]`` diff
+                # buckets that upstream ``unchanged``, never re-dials it, and
+                # keeps serving the tool list it cached when it first dialled
+                # — the new tool is invisible to every live session at once
+                # (2026-08-30: agents-platform-runners 0.96.0 -> 0.99.0 adding
+                # ``list_warm_containers``; again 2026-09-29: knowledgeable
+                # 0.2.0 -> 0.3.0 adding ``search_graph``). Folding the version
+                # into the compared spec moves exactly that ONE upstream into
+                # ``changed`` on a version bump, at the same cost as a genuine
+                # spec edit. It is the only mechanism that reaches a *stdio*
+                # upstream, whose already-spawned child answers ``tools/list``
+                # from the pre-update module it still holds in memory.
+                #
+                # Same seam as ``cwd_app_dir`` -> ``cwd`` just below:
+                # app-dir-derived data injected at scan time, so it reaches
+                # the diff through the generated ``config/mcp.json`` with no
+                # change to ``reload()`` itself. It MUST be injected HERE and
+                # nowhere else — ``Gateway._load_specs()`` reads this scan
+                # twice (once via ``load_mcp_servers()``, once directly), and
+                # a one-sided injection would make spec equality flap on
+                # every reload, i.e. a permanent re-dial storm.
+                if version is not None:
+                    spec["x_app_version"] = version
                 # Opt-in: a stdio server whose command/args reference files by a
                 # path relative to its own app root sets ``cwd_app_dir: true`` so
                 # the child spawns with cwd = that app's package dir (instead of

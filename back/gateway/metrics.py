@@ -91,6 +91,13 @@ class RollingCounters:
                 },
                 "upstream_unavailable_seconds": self.total(name, "upstream_unavailable_seconds", now),
                 "upstream_started_empty": self.total(name, "upstream_started_empty", now),
+                # Times reload() caught this upstream publishing a different
+                # tool list than the gateway was serving for it, under a spec
+                # that never changed, and re-dialled (Gateway.reload's
+                # `diverged` bucket). A rising count is the self-heal working;
+                # it rising CONSTANTLY on the same upstream means something
+                # is rewriting its tool surface between reloads.
+                "tools_diverged": self.total(name, "tools_diverged", now),
             }
         return out
 

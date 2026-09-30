@@ -511,7 +511,7 @@ class HttpUpstream:
         self.tools = listed.get("result", {}).get("tools", [])
         log.info("http upstream %s — %d tools", self.name, len(self.tools))
 
-    async def health_check(self) -> None:
+    async def health_check(self) -> list[dict]:
         """Cheap liveness probe for an upstream ``Gateway.reload()`` left
         running untouched because its spec didn't change — a ``tools/list``
         against the same client/URL already in use. Raises on failure; the
@@ -520,12 +520,23 @@ class HttpUpstream:
         retry already applies, before deciding whether it proves the
         connection is dead. See mcp-gateway-http-upstream-zombie-caching.
 
+        **Returns the tools the upstream reports right now**, which the caller
+        compares against the list this gateway is actually serving for it. The
+        probe already paid for that answer and used to throw it away, so the
+        divergence check it enables costs zero extra round trips — and an
+        upstream whose tool surface moved while its spec stayed identical
+        (its own container recreated by an app update) is otherwise invisible
+        (card mcp-gateway:reload-diff-ignores-app-version).
+
         Uses HEALTH_CHECK_TIMEOUT, not this client's full UPSTREAM_HTTP_TIMEOUT
         — a probe has no business inheriting the 600s read budget meant for a
         slow-but-eventually-successful tool call; see that constant's
         docstring."""
-        await self._post({"jsonrpc": "2.0", "id": "healthcheck", "method": "tools/list"},
-                          timeout=HEALTH_CHECK_TIMEOUT)
+        listed = await self._post({"jsonrpc": "2.0", "id": "healthcheck", "method": "tools/list"},
+                                  timeout=HEALTH_CHECK_TIMEOUT)
+        result = listed.get("result") if isinstance(listed, dict) else None
+        tools = (result or {}).get("tools") if isinstance(result, dict) else None
+        return list(tools) if isinstance(tools, list) else []
 
     async def call_tool(self, tool: str, arguments: dict, req_id, *, idempotent_hint: bool = False) -> dict:
         # Non-recursive federation (resilience:gateway-proof-gated-retry-with-

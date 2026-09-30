@@ -9,6 +9,7 @@ gateway mechanism itself.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import time
@@ -45,6 +46,21 @@ DEFAULT_ALLOW: list[str] = []  # empty = nothing local unless config/mcp.json + 
 PARK_TTL_SECONDS = 600
 
 
+def _tools_fingerprint(tools: list[dict]) -> str:
+    """Canonical form of one upstream's tool surface, for the divergence check
+    in ``Gateway.reload()``.
+
+    FULL tool dicts, not just names: ``_add_route`` folds ``description`` into
+    the published tool, and an ``inputSchema`` change is behaviorally visible
+    to every caller — a name-only comparison would call those "unchanged" and
+    keep serving a stale signature. Sorted by name first so an upstream that
+    merely reorders its own ``tools/list`` is not misread as having moved.
+    """
+    return json.dumps(
+        sorted(tools, key=lambda t: str(t.get("name", "")) if isinstance(t, dict) else str(t)),
+        sort_keys=True, default=str)
+
+
 class Gateway:
     def __init__(self, allow: list[str], gateway_id: str | None = None, max_federation_depth: int | None = None,
                  workspace_name: str | None = None):
@@ -72,6 +88,14 @@ class Gateway:
         # (time.monotonic), "tools": list[dict] (raw, pre-namespacing, for
         # restoring routes on repeated failure)}.
         self.unavailable: dict[str, dict] = {}
+        # upstream name -> the slug of the installed app whose mcp.json
+        # declared it (``scan_app_mcp_servers``'s ``sources``), refreshed on
+        # every _load_specs(). Only used to report, on /healthz, WHICH app
+        # each upstream belongs to alongside the version it was dialed at —
+        # core's `doctor` needs the pair to compare against
+        # apps/<slug>/aw-app.json. A custom (mcp.custom.json) upstream has no
+        # owning app and is absent here.
+        self.upstream_apps: dict[str, str] = {}
         # Reconnect-safe / collision-safe remote naming (see register_remote):
         self._remote_by_token: dict[str, RemoteUpstream] = {}  # token_id -> RemoteUpstream, survives disconnects
         self._remote_name_groups: dict[str, list[str]] = {}  # workspace+base_name -> [token_id, ...] order
@@ -92,7 +116,9 @@ class Gateway:
           allowlist.
         """
         servers = config.load_mcp_servers()
-        scanned, _sources = config.scan_app_mcp_servers()
+        scanned, sources = config.scan_app_mcp_servers()
+        self.upstream_apps = {name: str(src["app"]) for name, src in sources.items()
+                              if isinstance(src, dict) and src.get("app")}
         out = {}
         for name, spec in servers.items():
             if name not in scanned and name not in self.allow:
@@ -311,13 +337,23 @@ class Gateway:
         # container recreated with a new hostname, an IP reassigned — was
         # never noticed; see mcp-gateway-http-upstream-zombie-caching).
         dead_unchanged: set[str] = set()
+        diverged: set[str] = set()
         ambiguous_unchanged: set[str] = set()
         for name in sorted(unchanged):
             up = self.upstreams.get(name)
             if not isinstance(up, HttpUpstream):
-                continue  # stdio already self-heals via Upstream._ensure_alive()
+                # stdio already self-heals via Upstream._ensure_alive() — and a
+                # tools/list probe could not see a tool-surface divergence here
+                # even if it ran: the child is a process THIS gateway spawned,
+                # which keeps answering out of the pre-update module it already
+                # imported however new the code on its read-only app mount is.
+                # The divergence exists only on disk, so it is caught at the
+                # other end instead — by the owning app's version being part of
+                # upstream identity (config.scan_app_mcp_servers), which moves a
+                # version-bumped stdio upstream into `changed` above.
+                continue
             try:
-                await up.health_check()
+                served = await up.health_check()
             except Exception as exc:
                 error_class, proven = _classify_call_failure(exc)
                 if proven:
@@ -337,7 +373,23 @@ class Gateway:
                                 "leaving connection in place", name, exc)
                     metrics.counters.record(name, f"tools_call_errors.{error_class}")
                     ambiguous_unchanged.add(name)
-        unchanged -= dead_unchanged
+            else:
+                # The probe answered — so it also just told us what this
+                # upstream publishes NOW. A difference from what we are
+                # serving for it means its tool surface moved underneath a
+                # byte-identical spec (its own container recreated by an app
+                # update), which the spec diff cannot see and which leaves a
+                # shipped tool invisible to every live session. Re-dial it
+                # like any other upstream we know is wrong, rather than
+                # republishing routes onto a connection that may itself have
+                # moved. See card mcp-gateway:reload-diff-ignores-app-version.
+                if _tools_fingerprint(served) != _tools_fingerprint(up.tools):
+                    log.warning("upstream %s: tool surface diverged (serving %d, "
+                                "upstream reports %d) with an unchanged spec — re-dialling",
+                                name, len(up.tools), len(served))
+                    metrics.counters.record(name, "tools_diverged")
+                    diverged.add(name)
+        unchanged -= dead_unchanged | diverged
 
         # Real config removal — dropped right away, never parked. Only a
         # name that FAILS to (re)start below gets parked, with a TTL.
@@ -349,9 +401,16 @@ class Gateway:
             self._unpark(name)
 
         failed: list[dict] = []
-        for name in sorted(added | changed | parked_retry | dead_unchanged):
+        for name in sorted(added | changed | parked_retry | dead_unchanged | diverged):
             prior_tools: list[dict] | None = None
-            if name in changed or name in dead_unchanged:
+            # `diverged` belongs in this condition, not just in the loop range:
+            # it is what captures prior_tools, and without it a diverged
+            # upstream whose re-dial fails would be left ROUTELESS (tools/call
+            # -> "Unknown tool") instead of parked-with-routes like every
+            # other failed restart, including the zero-tool case in
+            # _start_one. Self-healing must not be able to make things worse
+            # than the staleness it was fixing.
+            if name in changed or name in dead_unchanged or name in diverged:
                 prior_up = self.upstreams.pop(name, None)
                 if prior_up is not None:
                     prior_tools = list(prior_up.tools)
@@ -377,14 +436,22 @@ class Gateway:
                 self._unpark(name)
 
         log.info("gateway reload: +%d -%d ~%d changed, %d reconnected (dead health check), "
-                 "%d unchanged, %d ambiguous health check, %d failed, %d parked — "
+                 "%d re-dialled (tool surface diverged), %d unchanged, "
+                 "%d ambiguous health check, %d failed, %d parked — "
                  "%d local upstreams, %d tools now",
-                 len(added), len(removed), len(changed), len(dead_unchanged), len(unchanged),
-                 len(ambiguous_unchanged), len(failed), len(self.unavailable),
+                 len(added), len(removed), len(changed), len(dead_unchanged), len(diverged),
+                 len(unchanged), len(ambiguous_unchanged), len(failed), len(self.unavailable),
                  len(self.upstreams), len(self.agg_tools))
         return {
             "added": sorted(added), "removed": sorted(removed),
             "changed": sorted(changed), "reconnected": sorted(dead_unchanged),
+            # Re-dialled because the upstream's own tools/list no longer
+            # matched what we publish for it, with a spec that never changed —
+            # its own key, not folded into `reconnected`, because the cause
+            # and the fix it proves are different (a stale tool surface, not a
+            # dead connection). Paired with a `tools_diverged` counter so the
+            # 24h window records every self-heal.
+            "diverged": sorted(diverged),
             "unchanged": sorted(unchanged),
             # Health-checked but inconclusive (e.g. ReadTimeout) — left
             # running untouched, same as `unchanged`, but broken out so this
@@ -679,6 +746,25 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
                 # what the core-side doctor check reads.
                 "warm_redis": await caller_context.warm_redis_status(),
                 "local_upstreams": list(gateway.upstreams),
+                # Which app, at which VERSION, each live upstream was actually
+                # DIALED from — the version that was on disk when this
+                # connection's tools/list was cached, not whatever is on disk
+                # now. That difference is the whole point: core's `doctor`
+                # compares this against apps/<slug>/aw-app.json, and a
+                # mismatch is the only way the version-skew failure is
+                # visible at all. From inside a session, "the tool I just
+                # shipped isn't there" is indistinguishable from the
+                # session-cache lesson (verify-new-gateway-tools-in-same-
+                # session) — which has already sent a diagnosis the wrong way
+                # once. Absent for a custom (mcp.custom.json) upstream, which
+                # has no owning app; ``version`` is null when the app's
+                # manifest was unreadable at scan time.
+                "upstream_app_versions": {
+                    name: {"app": gateway.upstream_apps[name],
+                           "version": (up.spec or {}).get("x_app_version")}
+                    for name, up in gateway.upstreams.items()
+                    if name in gateway.upstream_apps
+                },
                 "remote_upstreams": list(gateway.remotes),
                 "tools": len(gateway.agg_tools),
                 "configs": configs.names(),
