@@ -383,7 +383,12 @@ class Gateway:
                 # like any other upstream we know is wrong, rather than
                 # republishing routes onto a connection that may itself have
                 # moved. See card mcp-gateway:reload-diff-ignores-app-version.
-                if _tools_fingerprint(served) != _tools_fingerprint(up.tools):
+                # publishable_tools(), not the raw payload: a federated
+                # (`type: gateway`) upstream scoped by `allowed_tools`
+                # publishes a strict subset of what its peer lists, and
+                # comparing the unfiltered list made both of this workspace's
+                # federated upstreams re-dial on EVERY reload.
+                if _tools_fingerprint(up.publishable_tools(served)) != _tools_fingerprint(up.tools):
                     log.warning("upstream %s: tool surface diverged (serving %d, "
                                 "upstream reports %d) with an unchanged spec — re-dialling",
                                 name, len(up.tools), len(served))

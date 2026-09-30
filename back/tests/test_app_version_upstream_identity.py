@@ -387,6 +387,61 @@ async def test_a_diverged_upstream_that_fails_to_redial_parks_with_its_routes(mo
     assert "Unknown tool" not in json.dumps(resp)
 
 
+async def test_a_federated_upstream_scoped_by_allowed_tools_does_not_diverge(monkeypatch):
+    """The re-dial loop this check actually caused, found live on 2026-09-30.
+
+    ``GatewayUpstream.start()`` publishes only the ``allowed_tools`` subset of
+    what its peer lists, so comparing the RAW probe payload against
+    ``up.tools`` is unequal by construction — every reload reported divergence
+    and tore the connection down. Both of this workspace's federated upstreams
+    had re-dialled 46 and 47 times within 10 minutes of the fix going live, on
+    the awaited install critical path. Two consecutive reloads with nothing
+    changed must both leave it alone."""
+    remote = [TOOL_ECHO, TOOL_NEW]
+    spec = {"type": "gateway", "enabled": True, "url": "http://peer.example/mcp",
+            "allowed_tools": ["echo"]}
+
+    async def _get(self, url, **kw):
+        class _R:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {"gateway_id": "peer", "federation_chain": ["peer"]}
+        return _R()
+
+    async def _post(self, msg, *, timeout=None):
+        method = msg.get("method")
+        if method == "initialize":
+            return {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"serverInfo": {"name": "peer"}}}
+        if method == "tools/list":
+            return {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"tools": list(remote)}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr("gateway.upstream.httpx.AsyncClient.get", _get, raising=False)
+    monkeypatch.setattr(HttpUpstream, "_post", _post)
+
+    gw = Gateway(["peer"])
+    with _servers({"peer": spec}):
+        await gw.start()
+    original_upstream = gw.upstreams["peer"]
+    assert [t["name"] for t in original_upstream.tools] == ["echo"]  # narrowed
+
+    for _ in range(2):
+        with _servers({"peer": spec}):
+            result = await gw.reload()
+        assert result["diverged"] == []
+        assert gw.upstreams["peer"] is original_upstream
+
+    # And a real change on the peer, INSIDE the allowed scope, is still caught.
+    remote[0] = {**TOOL_ECHO, "description": "peer rewrote it"}
+    with _servers({"peer": spec}):
+        result = await gw.reload()
+    assert result["diverged"] == ["peer"]
+
+
 async def test_stdio_is_never_divergence_probed():
     """A stdio child is a process THIS gateway spawned: it answers tools/list
     out of the module it already imported, so the probe would read the OLD

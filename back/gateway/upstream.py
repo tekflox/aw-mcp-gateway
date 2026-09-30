@@ -538,6 +538,22 @@ class HttpUpstream:
         tools = (result or {}).get("tools") if isinstance(result, dict) else None
         return list(tools) if isinstance(tools, list) else []
 
+    def publishable_tools(self, listed: list[dict]) -> list[dict]:
+        """Narrow a freshly-fetched ``tools/list`` to what this upstream would
+        actually PUBLISH — i.e. whatever ``start()`` assigns to ``self.tools``.
+
+        Identity for a plain HTTP upstream; ``GatewayUpstream`` overrides it to
+        apply ``allowed_tools``. ``Gateway.reload()``'s divergence check must
+        compare against this and never against the raw payload: a federated
+        upstream scoped by ``allowed_tools`` publishes a strict SUBSET of what
+        its peer lists, so a raw comparison reports divergence on every single
+        reload — a permanent re-dial loop on the awaited install path. Measured
+        live 2026-09-30 before this existed: two ``type: gateway`` upstreams
+        (`fredericowu`, `fredericowu-browser`) had re-dialled 46 and 47 times
+        inside 10 minutes.
+        """
+        return list(listed)
+
     async def call_tool(self, tool: str, arguments: dict, req_id, *, idempotent_hint: bool = False) -> dict:
         # Non-recursive federation (resilience:gateway-proof-gated-retry-with-
         # counters, decision 4): a gateway that received THIS call from
@@ -661,6 +677,14 @@ class GatewayUpstream(HttpUpstream):
         allowed = original_spec.get("allowed_tools")
         self.allowed_tools: set[str] | None = set(allowed) if allowed is not None else None
 
+    def publishable_tools(self, listed: list[dict]) -> list[dict]:
+        """``allowed_tools`` narrowing — the same filter ``start()`` applies,
+        so reload()'s divergence check compares like with like. See the base
+        implementation for why a raw comparison is a re-dial loop here."""
+        if self.allowed_tools is None:
+            return list(listed)
+        return [t for t in listed if t.get("name") in self.allowed_tools]
+
     def _client_headers(self) -> dict[str, str]:
         # Every request this class sends IS a gateway-to-gateway hop by
         # definition — mark it unconditionally so the far side can make
@@ -713,7 +737,7 @@ class GatewayUpstream(HttpUpstream):
                                   timeout=HANDSHAKE_HTTP_TIMEOUT)
         remote_tools = listed.get("result", {}).get("tools", [])
         if self.allowed_tools is not None:
-            self.tools = [t for t in remote_tools if t.get("name") in self.allowed_tools]
+            self.tools = self.publishable_tools(remote_tools)
             log.info("gateway upstream %s — %d/%d federated tools published (scoped by allowed_tools, "
                      "remote id=%s, chain depth=%d)",
                      self.name, len(self.tools), len(remote_tools), self.remote_gateway_id,
