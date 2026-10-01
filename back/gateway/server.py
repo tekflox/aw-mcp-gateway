@@ -679,7 +679,7 @@ class NamedConfigs:
 
 def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
               token_store: TokenStore | None = None, port: int = 9200,
-              config_sources: dict | None = None) -> FastAPI:
+              config_sources: dict | None = None, require_token: bool = True) -> FastAPI:
     from contextlib import asynccontextmanager
 
     # Accepts the historical ``{name: [upstreams]}`` shape as well as the full
@@ -720,7 +720,12 @@ def build_app(gateway: Gateway, token: str, named_configs: dict | None = None,
         _check_auth(authorization)
 
     async def _dispatch(handler, request: Request, authorization: str | None) -> Response:
-        _check_auth(authorization)
+        # require_token: false is the opt-in that lets a trusted-network-only
+        # leaf (e.g. a Kali-sandboxed gateway with no published port) skip the
+        # bearer check on /mcp specifically — every other route (admin config,
+        # link-tokens, external-upstreams) still goes through _check_auth.
+        if require_token:
+            _check_auth(authorization)
         # Before any upstream call in this request's task — see caller_context.
         await caller_context.capture(request.headers)
         body = await request.json()
@@ -1220,14 +1225,30 @@ def main() -> None:
     else:
         allow = DEFAULT_ALLOW
 
+    require_tok = config.require_token()
+    if not require_tok and config.public_exposure_configured():
+        raise SystemExit(
+            "refusing to start: config/gateway.json has require_token=false AND "
+            "public=true — a tokenless /mcp must never be reachable from outside "
+            "a trusted network. Set public=false, or remove require_token, or "
+            "front this gateway with its own auth before exposing it.")
+    if not require_tok:
+        log.warning(
+            "SECURITY: require_token=false — /mcp accepts ANY caller with no "
+            "bearer check. Only safe when nothing but a trusted private network "
+            "(e.g. a podman app network with no published port) can reach this "
+            "gateway.")
+
     tok = config.token()
     gateway = Gateway(allow)
     named_configs, config_sources = config.effective_named_configs()
-    app = build_app(gateway, tok, named_configs, config_sources=config_sources, port=args.port)
+    app = build_app(gateway, tok, named_configs, config_sources=config_sources,
+                     port=args.port, require_token=require_tok)
 
     log.info("AW MCP Gateway (standalone) on http://%s:%d/mcp (+ ws /link)", args.host, args.port)
     log.info("local upstream allowlist: %s", ", ".join(allow) or "—")
     log.info("bearer token: %s (source: config/gateway.json)", "set" if tok else "MISSING")
+    log.info("require_token: %s", require_tok)
     log.info("gateway_id: %s | max_federation_depth: %d | link tokens: %s",
              gateway.gateway_id, gateway.max_federation_depth, config.link_tokens_path())
 

@@ -653,6 +653,25 @@ def token() -> str:
     return tok
 
 
+def require_token() -> bool:
+    """Whether ``/mcp`` must present the bearer token at all.
+
+    Opt-in escape hatch for a gateway that only a trusted network path can
+    reach (e.g. a leaf gateway on a podman app network, never published) and
+    whose token would otherwise need bridging into a parent that only knows a
+    static package file — see ``public_exposure_configured()`` for the check
+    that keeps this off a gateway actually reachable from outside."""
+    return bool(load_gateway_config().get("require_token", True))
+
+
+def public_exposure_configured() -> bool:
+    """``gateway.json``'s own ``public`` flag — this gateway's self-declared
+    "something outside this host/network can reach me" bit. Not wired to any
+    routing layer by this repo; a deploying app sets it so this process can
+    refuse to boot ``require_token: false`` and public at once."""
+    return bool(load_gateway_config().get("public", False))
+
+
 def register_self_in_host_mcp_json(port: int, bearer_token: str) -> None:
     """Best-effort: add/update this gateway's own entry in the aw-workspace
     host's root ``.mcp.json`` so an MCP-JSON-reading client (Claude Code, any
