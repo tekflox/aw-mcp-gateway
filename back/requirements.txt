@@ -30,4 +30,6 @@ mcp>=1.2,<2.0
 # commit aw-app-travel's own pip_requires uses (PyPI's flights==0.9.0 has
 # Google's August x-goog-batchexecute-bgr RPC change unfixed, see
 # github.com/punitarani/fli issue #223 / PR #230) — keep these two in sync.
-flights @ git+https://github.com/punitarani/fli.git@5c092f12e10db925f68768d97cb08cb7fdcbbacc
+# Archive tarball, not git+https: this image's base has no `git` binary and
+# pip's VCS installer hard-requires one even for a single commit checkout.
+flights @ https://github.com/punitarani/fli/archive/5c092f12e10db925f68768d97cb08cb7fdcbbacc.tar.gz
