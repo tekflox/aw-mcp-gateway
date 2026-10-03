@@ -20,11 +20,14 @@ redis>=5.0
 # 1.x API shape, matching its own aw-app.json's declared "mcp>=1.2".
 mcp>=1.2,<2.0
 # Same reasoning, same fix, for aw-app-travel's stdio upstream (`python3 -m
-# travel_app.mcp_server`): its aw-app.json declares runtime.pip_requires =
-# ["flights"] (PyPI dist name for the `fli` import), which — like every
-# Tier-1 app's pip_requires — installs nothing into this Tier-2 container.
-# Without it the child crashes on `from fli.core import ...` before ever
-# answering the handshake; the gateway sees the pipe die mid-negotiation and
-# logs a misleading "WriteUnixTransport closed" RuntimeError instead of the
-# real ModuleNotFoundError (stderr is DEVNULL'd in Upstream._spawn()).
-flights>=0.9,<0.10
+# travel_app.mcp_server`): its aw-app.json declares runtime.pip_requires,
+# which — like every Tier-1 app's pip_requires — installs nothing into this
+# Tier-2 container. Without it the child crashes on `from fli.core import
+# ...` before ever answering the handshake; the gateway sees the pipe die
+# mid-negotiation and logs a misleading "WriteUnixTransport closed"
+# RuntimeError instead of the real ModuleNotFoundError (stderr is DEVNULL'd
+# in Upstream._spawn()). Pinned to the same merged-but-unreleased upstream
+# commit aw-app-travel's own pip_requires uses (PyPI's flights==0.9.0 has
+# Google's August x-goog-batchexecute-bgr RPC change unfixed, see
+# github.com/punitarani/fli issue #223 / PR #230) — keep these two in sync.
+flights @ git+https://github.com/punitarani/fli.git@5c092f12e10db925f68768d97cb08cb7fdcbbacc
