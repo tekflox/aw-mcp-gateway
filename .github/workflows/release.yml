@@ -1,5 +1,34 @@
 name: Release
 
+# Three jobs, strictly sequential, in this order:
+#
+#   1. changed-paths — does this push touch a file that ends up in the
+#      published image? back/Dockerfile does `COPY . .` with build context
+#      `back/`, so literally anything under back/ lands in the image;
+#      front/ and connector/ never do (they're built by build.yml, never
+#      published — read straight off the Dockerfile, not guessed from
+#      directory names). A docs/metadata-only push (README, docs/,
+#      aw-app.json itself, front/, connector/) answers "no" and nothing
+#      below it runs.
+#   2. publish — only when (1) says yes: builds + pushes the image to
+#      GHCR (amd64-only; see publish.yml's header for the measured
+#      arm64/QEMU cost). Must SUCCEED before `release` is allowed to run.
+#   3. release — the existing reusable version-bump + marketplace-catalog
+#      sync. Deliberately LAST: it is what advertises a new version to
+#      `--update`, so by the time anything can see the bump, the matching
+#      image is already on GHCR — publishing first (not after, not
+#      parallel) is what actually closes the race, since the catalog PR
+#      this step opens can auto-merge within seconds of this job
+#      finishing. Running the bump before/alongside the build just moves
+#      the same bug to a shorter window instead of closing it.
+#
+# If `publish` fails, `release` is skipped outright (its `if:` below) — no
+# version bump, no catalog PR, nothing advertised. A bumped version with
+# no matching image is the same silent-staleness bug wearing a different
+# hat (finding ci:container-app-release-does-not-build-the-image), so this
+# chain refuses to produce one. The failure is visible exactly where any
+# other failed Action is: this run goes red in the repo's Actions tab and
+# as a failed check on the commit — there is nowhere else to look.
 on:
   push:
     branches: [main]
@@ -11,7 +40,55 @@ on:
         options: [major]
 
 jobs:
+  changed-paths:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether this push touches the published image
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "Manual release dispatch — building unconditionally."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BASE="${{ github.event.before }}"
+          if [ -z "$BASE" ] || [[ "$BASE" =~ ^0+$ ]]; then
+            echo "No usable base commit (new branch?) — building unconditionally."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED="$(git diff --name-only "$BASE" "${{ github.sha }}")"
+          echo "Changed files in this push:"
+          echo "$CHANGED"
+          # Mirrors exactly what back/Dockerfile COPYs into the image (the
+          # whole build context) — see its header, and publish.yml's.
+          if echo "$CHANGED" | grep -qE '^back/'; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: changed-paths
+    if: needs.changed-paths.outputs.build == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      include_arm64: false
+    secrets: inherit
+
   release:
+    needs: [changed-paths, publish]
+    if: always() && needs.changed-paths.result == 'success' && needs.publish.result != 'failure'
     # Moving ref: bumping app-release.yml in aw-marketplace propagates here
     # automatically. Move to @v1 once aw-marketplace cuts a first tag.
     #
@@ -19,6 +96,7 @@ jobs:
     # `contents: write` request is checked against — this repo's default
     # workflow permissions are read-only, so without this the run fails at
     # startup (startup_failure, zero jobs) before ever reaching aw-marketplace.
+    # Runs LAST on purpose, see the file header above.
     permissions:
       contents: write
     uses: tekflox/aw-marketplace/.github/workflows/app-release.yml@master

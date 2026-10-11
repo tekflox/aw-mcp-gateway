@@ -3,13 +3,31 @@ name: Publish gateway image
 # Builds the gateway server (back/) and pushes it to ghcr.io/<owner>/aw-mcp-gateway.
 # Uses GHCR_PAT when configured so the workflow can update an existing org
 # package that was first published outside this repo; otherwise falls back to
-# the workflow-scoped GITHUB_TOKEN. Manual trigger only (no automatic GHA runs —
-# cost/quota conscious, mirrors tekflox/aw-app-browser's build.yml).
+# the workflow-scoped GITHUB_TOKEN. Two ways in:
+#
+#   - workflow_dispatch: manual run, amd64-only by default.
+#   - workflow_call: release.yml's `publish` job calls this automatically,
+#     BEFORE the version bump + marketplace sync, whenever a push to `main`
+#     touches anything under back/ — that is literally this Dockerfile's
+#     whole build context (`COPY . .`), so any file under back/ changes the
+#     image; front/ and connector/ are built by build.yml but never reach
+#     this image at all (see release.yml's `changed-paths` job, keep the
+#     two in sync). A docs/metadata-only push never reaches this job, so
+#     it never pays for a build. Always amd64-only on the automatic path —
+#     QEMU arm64 emulation measured ~8x slower on this runner (run
+#     36450565287, 2026-09-28: 11m with arm64 vs. this same workflow's own
+#     ~80s amd64-only baseline) — manual runs can still opt in below.
 #
 #   gh workflow run publish.yml                        # amd64
 #   gh workflow run publish.yml -f include_arm64=true  # + linux/arm64 (QEMU)
 on:
   workflow_dispatch:
+    inputs:
+      include_arm64:
+        description: 'Also build linux/arm64 (QEMU emulation; slower)'
+        type: boolean
+        default: false
+  workflow_call:
     inputs:
       include_arm64:
         description: 'Also build linux/arm64 (QEMU emulation; slower)'
