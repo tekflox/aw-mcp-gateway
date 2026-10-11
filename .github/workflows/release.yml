@@ -88,7 +88,13 @@ jobs:
 
   release:
     needs: [changed-paths, publish]
-    if: always() && needs.changed-paths.result == 'success' && needs.publish.result != 'failure'
+    # publish.yml's own `concurrency: cancel-in-progress` group is honored
+    # even across workflow_call invocations, so two close pushes to main can
+    # have push A's publish job cancelled by push B's. A cancelled job's
+    # `result` is 'cancelled', not 'failure' — excluding only 'failure' let
+    # push A's release proceed and advertise a version whose image build
+    # never finished. Require success-or-skipped instead.
+    if: always() && needs.changed-paths.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
     # Moving ref: bumping app-release.yml in aw-marketplace propagates here
     # automatically. Move to @v1 once aw-marketplace cuts a first tag.
     #
