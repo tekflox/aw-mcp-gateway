@@ -22,7 +22,7 @@ def _no_real_warm_redis_probing(monkeypatch):
     """
     for var in ("AW_MCP_GATEWAY_WARM_REDIS_URL", "AW_SHARED_REDIS_URL"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(warm_redis, "_accepts_tcp", lambda host, port: False)
+    monkeypatch.setattr(warm_redis, "_probe", lambda host, port, user, password: "down")
     warm_redis.reset_cache()
     yield
     warm_redis.reset_cache()
