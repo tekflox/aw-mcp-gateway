@@ -7,6 +7,29 @@ websockets>=12.0
 # AW_SHARED_REDIS_URL is unset or unreachable, but the import itself must
 # succeed.
 redis>=5.0
+# OpenTelemetry for the stdio UPSTREAMS this container spawns, not for the
+# gateway itself (yet — that's its own Kanban card). Same reason `mcp` and
+# `flights` below are here: a Tier-1 app's aw-app.json runtime.pip_requires
+# installs nothing into this (separate) container, and `python3 -m
+# <app>.mcp_server` runs against THIS image's interpreter.
+#
+# Today's consumer is aw-app-agents-platform-runners' MCP child
+# (agents_platform_runners_app/mcp_otel.py), which every agent's run-dispatch
+# path goes through: without the SDK here it emitted no spans, propagated no
+# traceparent to agents-platform-multitenant, and reached SigNoz only as
+# untagged container-stdout text (Kanban observability:runners-app-no-otel-
+# instrumentation). Its import is guarded, so this pin and that app's release
+# can land in either order.
+#
+# Pinned to aw-workspace core's own versions (its requirements.txt lines
+# 33-36) so one workspace doesn't run two OTel SDK generations. Note the
+# deliberate omission of opentelemetry-instrumentation-requests: the OTLP
+# http exporter is built on `requests`, so instrumenting it makes the
+# exporter trace its own POST — a feedback loop. Core skips it for the same
+# reason.
+opentelemetry-sdk==1.40.0
+opentelemetry-exporter-otlp-proto-http==1.40.0
+opentelemetry-instrumentation-httpx==0.61b0
 # For local stdio upstreams that are themselves built on the official MCP
 # Python SDK (today: aw-app-devctl's devctl-browser, `from mcp.server.fastmcp
 # import FastMCP`) — those apps declare this in their own aw-app.json
