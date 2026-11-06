@@ -44,7 +44,12 @@
     "mcp:register-gateway",
     "fs:workspace-data"
   ],
-  "contributes": {},
+  "contributes": {
+    "agents_md": {
+      "path": "docs/AGENTS-block.md",
+      "title": "MCP gateway"
+    }
+  },
   "config_schema": {
     "type": "object",
     "properties": {
