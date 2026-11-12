@@ -48,7 +48,14 @@
     "agents_md": {
       "path": "docs/AGENTS-block.md",
       "title": "MCP gateway"
-    }
+    },
+    "skills": [
+      {
+        "id": "aw-mcp-gateway",
+        "path": "skills/aw-mcp-gateway/SKILL.md",
+        "description": "A gateway tool looks absent or missing from tools/list, or a federated upstream's tool pool seems smaller than expected — before concluding the tool doesn't exist upstream, check this gateway's own tools_allow allowlist. Use whenever a tool a workspace should have access to isn't showing up through aw-gateway, or when editing a named config's tool/run policy."
+      }
+    ]
   },
   "config_schema": {
     "type": "object",
