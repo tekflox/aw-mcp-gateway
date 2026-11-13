@@ -98,6 +98,15 @@ class RollingCounters:
                 # it rising CONSTANTLY on the same upstream means something
                 # is rewriting its tool surface between reloads.
                 "tools_diverged": self.total(name, "tools_diverged", now),
+                # First watchdog warning (Upstream.call_tool's 30s slices,
+                # see upstream.py's CALL_WATCHDOG_SLICE_SECONDS) hit for a
+                # given stdio call — recorded once per call, not once per
+                # slice, so this counts SLOW CALLS, not elapsed 30s ticks.
+                # This is the only signal a doctor/monitoring reader has for
+                # "a stdio upstream's one shared child is stuck behind a
+                # long-running call" without tailing logs — see
+                # runners-stdio-mcp-child-sequential-head-of-line-blocking.
+                "tools_call_slow": self.total(name, "tools_call_slow", now),
             }
         return out
 
