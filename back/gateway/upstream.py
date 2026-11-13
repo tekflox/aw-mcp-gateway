@@ -122,6 +122,33 @@ def next_wire_id() -> str:
     """A process-unique JSON-RPC id for one in-flight call to a shared upstream."""
     return f"awg-{next(_wire_ids)}"
 
+
+#: ``Upstream.call_tool`` used to do a bare ``resp = await fut`` on the reply
+#: future, with zero visibility while a call was in flight — a long-running
+#: but entirely legitimate call (e.g. a 997s run_monitor_sync poll) silently
+#: starves every OTHER call queued behind it on this upstream's ONE shared
+#: child process (the child answers requests strictly sequentially), with no
+#: gateway log, no error, nothing, until the queued calls either time out
+#: client-side or drain once the blocker finishes
+#: (runners-stdio-mcp-child-sequential-head-of-line-blocking). Waiting on the
+#: future in slices of this size — logging a WARNING and bumping
+#: ``tools_call_slow`` (see metrics.py) the first time a call crosses one —
+#: makes that hang visible while it is still happening, without changing
+#: how long a legitimate call is allowed to run.
+CALL_WATCHDOG_SLICE_SECONDS = 30.0
+
+#: Hard backstop on one stdio call's reply future — intentionally well ABOVE
+#: both ``wait_run``'s legitimate 3600s max wait and an approval-gated tool's
+#: ~900s typical ceiling (see ``UPSTREAM_HTTP_TIMEOUT``'s read=600.0 for the
+#: HTTP upstream's analogous budget, smaller because an HTTP upstream isn't
+#: also serialized behind one shared child the way this stdio ``Upstream``
+#: is). The Architect's design for this card explicitly rejects a short
+#: per-call timeout as "the fix" here — a shorter value would actively break
+#: those legitimate long waits. This backstop exists only to bound the
+#: genuinely-wedged case (the child died without the reader loop noticing)
+#: and to free the pending-replies slot instead of leaking it forever.
+CALL_HARD_BACKSTOP_SECONDS = 3900.0
+
 #: Proof-gated retry (resilience:gateway-proof-gated-retry-with-counters):
 #: 3 attempts total (1 original + 2 retries), 1s then 2s backoff between them.
 MAX_CALL_ATTEMPTS = 3
@@ -368,7 +395,73 @@ class Upstream:
             except Exception:
                 self._pending.pop(wire_id, None)
                 raise
-        resp = await fut
+
+        log.info(
+            "upstream %s: sent tools/call tool=%s wire_id=%s caller_run_id=%s "
+            "pending_depth=%d", self.name, tool, wire_id, caller_run_id, len(self._pending))
+
+        # Watchdog: wait on the reply future in CALL_WATCHDOG_SLICE_SECONDS
+        # slices instead of one bare `await fut` — see that constant's
+        # docstring for why (makes a merely-slow call visible instead of
+        # silent until it either finishes or the caller gives up). The
+        # `finally` guarantees the pending-replies slot is freed no matter
+        # how this exits: normal reply, the hard backstop below, or this
+        # coroutine itself getting cancelled (e.g. the original MCP client
+        # disconnected before the child replied) — without it, a cancelled
+        # wait left the entry in `self._pending` forever, and the child's
+        # eventual reply was silently discarded into a dangling future
+        # nobody was still awaiting.
+        #
+        # `asyncio.shield(fut)`, not bare `fut`: asyncio.wait_for cancels
+        # whatever it's given directly on timeout — on a bare Future that
+        # means cancelling `fut` itself, the exact object still sitting in
+        # `self._pending`. The first 30s slice would permanently cancel it,
+        # so the reader loop's later `fut.set_result(msg)` would raise
+        # InvalidStateError instead of ever delivering the real reply.
+        # Shielding gives wait_for a disposable wrapper to cancel each slice
+        # while `fut` itself stays untouched, pending the real reply.
+        start = asyncio.get_event_loop().time()
+        warned = False
+        try:
+            while True:
+                try:
+                    resp = await asyncio.wait_for(asyncio.shield(fut), timeout=CALL_WATCHDOG_SLICE_SECONDS)
+                    break
+                except asyncio.TimeoutError:
+                    elapsed = asyncio.get_event_loop().time() - start
+                    if elapsed >= CALL_HARD_BACKSTOP_SECONDS:
+                        log.error(
+                            "upstream %s: tools/call tool=%s wire_id=%s caller_run_id=%s "
+                            "exceeded the %.0fs hard backstop (elapsed=%.0fs) — giving up "
+                            "and freeing the pending slot; the child may still answer "
+                            "later but nothing is listening for it anymore",
+                            self.name, tool, wire_id, caller_run_id,
+                            CALL_HARD_BACKSTOP_SECONDS, elapsed)
+                        return {"jsonrpc": "2.0", "id": req_id, "result": {
+                            "content": [{"type": "text",
+                                         "text": f"upstream '{self.name}' tool '{tool}' did "
+                                                 f"not reply within "
+                                                 f"{int(CALL_HARD_BACKSTOP_SECONDS)}s "
+                                                 f"(elapsed={int(elapsed)}s, wire_id="
+                                                 f"{wire_id}) — treat this as retryable, "
+                                                 f"not a permanent failure"}],
+                            "isError": True}}
+                    if not warned:
+                        warned = True
+                        metrics.counters.record(self.name, "tools_call_slow")
+                    log.warning(
+                        "upstream %s: tools/call tool=%s wire_id=%s caller_run_id=%s still "
+                        "waiting after %.0fs (pending_depth=%d)",
+                        self.name, tool, wire_id, caller_run_id, elapsed, len(self._pending))
+        finally:
+            self._pending.pop(wire_id, None)
+
+        elapsed = asyncio.get_event_loop().time() - start
+        log.info(
+            "upstream %s: tools/call tool=%s wire_id=%s caller_run_id=%s completed after "
+            "%.1fs%s", self.name, tool, wire_id, caller_run_id, elapsed,
+            " (had warned slow)" if warned else "")
+
         if resp is None:
             self.proc = None
             return {"jsonrpc": "2.0", "id": req_id, "result": {
